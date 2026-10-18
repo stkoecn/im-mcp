@@ -1,5 +1,6 @@
 import datetime
 import functools
+import logging
 import re
 import sqlite3
 from pathlib import Path
@@ -10,6 +11,14 @@ from mcp.server.fastmcp import FastMCP
 from .config import DB_PATH, BASE_DIR
 from .database import get_connection, init_schema, release_connections, sync_data
 from .images import get_image_for_message
+from .auto_sync import (
+    get_auto_sync_status as _auto_sync_status,
+    restore_on_startup,
+    set_auto_sync as _set_auto_sync,
+    sync_now,
+)
+
+logger = logging.getLogger(__name__)
 
 # 初始化 FastMCP 服务器
 mcp = FastMCP("wechat-mcp")
@@ -437,16 +446,47 @@ def get_messages_by_date(date: str, session_id: Optional[str] = None, limit: int
 
 @mcp.tool()
 @_db_tool
-def sync_wechat_database(force: bool = False) -> Dict[str, Any]:
+def sync_wechat_database(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
     """触发数据导入同步，使本地 MCP 数据库保持最新状态。
-    
+
+    注意：绿泡泡数据库是加密的，本地索引读的是**解密快照**。只重建 ETL 读到的仍是旧
+    快照（永远拿不到新消息），因此本工具默认会**先重新解密源库**再重建索引。
+
+    同步耗时取决于数据量（实测约 10–20 秒），期间调用会阻塞。
+
     Args:
-        force: 是否强制全量同步
+        force: 是否强制全量重建索引（忽略指纹，默认 False）
+        redecrypt: 是否先重新解密源库（默认 True；设为 False 则只重建索引）
     """
-    etl_result = sync_data(force=force)
-    return {
-        "etl_step": etl_result
-    }
+    return sync_now(force=force, redecrypt=redecrypt)
+
+
+@mcp.tool()
+@_db_tool
+def set_auto_sync(enabled: bool, interval_minutes: Optional[int] = None) -> Dict[str, Any]:
+    """开启 / 关闭**定时自动同步**（重新解密源库 + 重建索引）。
+
+    定时器在本 MCP 进程内以后台线程运行，因此只在 MCP 服务存活期间生效（随 Snow App
+    启停）；开关、间隔与运行记录持久化到 ~/.wechat_mcp/auto_sync.json，服务重启后自动恢复。
+
+    每个周期会执行一次完整同步（等价于调用 sync_wechat_database），因此间隔不宜过短。
+
+    Args:
+        enabled: True 开启，False 关闭
+        interval_minutes: 同步间隔（分钟），钳制到 5–1440。
+                          省略则沿用上次设置（从未设置过时为 30）。
+    """
+    return _set_auto_sync(enabled=enabled, interval_minutes=interval_minutes)
+
+
+@mcp.tool()
+@_db_tool
+def get_auto_sync_status() -> Dict[str, Any]:
+    """查看定时自动同步的状态：开关、间隔、运行次数、上次运行结果。
+
+    用于确认「定时同步到底有没有在跑」以及上一轮同步是否成功。
+    """
+    return _auto_sync_status()
 
 @mcp.tool()
 @_db_tool
@@ -945,6 +985,11 @@ def get_persona_style(sender: str, session_id: Optional[str] = None, sample_limi
     }
 
 def main():
+    # 恢复持久化的定时同步（未开启则什么都不做）
+    try:
+        restore_on_startup()
+    except Exception as exc:  # noqa: BLE001 - 恢复失败不应阻止服务启动
+        logger.warning(f"恢复定时同步失败：{exc}")
     mcp.run()
 
 if __name__ == "__main__":

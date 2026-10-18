@@ -3,6 +3,22 @@
 本文件逐条记录本仓库相对上游 `stkoecn/im-mcp` 初始版本（v0.0.1）的全部改动，
 便于上游维护者对照 review（对应 PR #10）。所有改动均已实测复现后再修改。
 
+## 真同步与定时同步（`auto_sync.py` + 两个新工具）
+
+- **`sync_wechat_database` 此前是「假同步」**：它只调用 `sync_data()`（重建 ETL），而索引
+  读的是**解密快照** `~/.wechat_mcp/decrypted/`，该快照只由 `wechat-init` 生成。源库里新
+  写入的消息因此永远进不了索引，工具名承诺的「保持最新状态」实际做不到。现新增
+  `redecrypt` 参数（默认 `True`）：**先重新解密源库**再重建索引；显式传 `False` 保留旧行为。
+- **新增 `set_auto_sync(enabled, interval_minutes)` / `get_auto_sync_status()`**：在 MCP
+  进程内以后台线程定时执行完整同步；开关 / 间隔 / 运行记录持久化到
+  `~/.wechat_mcp/auto_sync.json`，服务启动时由 `main()` 调 `restore_on_startup()` 自动恢复。
+  间隔钳制到 5–1440 分钟；省略 `interval_minutes` 时沿用上次设置（此前会退回默认 30）。
+- **重新解密走子进程而非进程内调用**：`key_tool._decrypt_database` 内部有 `_print()`，
+  而 MCP 用 stdio 传 JSON-RPC —— **任何 stdout 输出都会破坏协议**。子进程把输出隔离在管道里，
+  同时复用已验证的 CLI 路径（`key_tool decrypt`），且不需要管理员权限。
+- **解密失败时不重建索引**：在旧快照上重建只会「看起来成功」但内容没变，因此返回
+  `ok: false` 并带上失败原因。
+
 ## 新增 MCP 工具（绿泡泡侧 6 → 15 个，全部只读）
 
 | 工具 | 说明 |

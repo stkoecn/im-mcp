@@ -36,10 +36,12 @@ class TestRealHostEndToEnd(unittest.TestCase):
             "list_emoticons",
             "get_sync_status",
             "get_persona_style",
+            "set_auto_sync",
+            "get_auto_sync_status",
         ]
         for exp in expected_tools:
             self.assertIn(exp, tools)
-        self.assertEqual(len(tools), 16)
+        self.assertEqual(len(tools), 18)
 
     def test_sync_status_tool_structure(self):
         if not self.db_available:
