@@ -3,6 +3,32 @@
 本文件逐条记录本仓库相对上游 `stkoecn/im-mcp` 初始版本（v0.0.1）的全部改动，
 便于上游维护者对照 review（对应 PR #10）。所有改动均已实测复现后再修改。
 
+## 头像索引与新工具 `get_user_avatars`
+
+- 新增 `adapters/avatars.py`：把此前“已解密但从未被使用”的 `head_image.db` 接进来。
+  该库结构为 `head_image(username TEXT PRIMARY KEY, md5 TEXT, image_buffer BLOB,
+  update_time INTEGER)`，`image_buffer` 是**可直接渲染的 JPEG/PNG 原图**（实测样本 3284 条，
+  绝大多数为 JPEG、少量 PNG，91 B – 45 KB），无需任何解密。ETL 按 `md5` 落盘到
+  `~/.wechat_mcp/avatars/<md5>.<ext>`（同一头像被多个 username 共用，天然去重），
+  中间库新增 `avatars` 表只存「username → 文件路径」，与 `get_message_image` 保持
+  同一套「返回 file_path、由宿主读盘」的契约，不走 base64。
+  实测发言者头像覆盖率：群 53% – 100%（未缓存的成员静默缺失）。
+- 新增只读工具 `get_user_avatars(usernames)`：批量返回头像本地绝对路径。批量而非单个，
+  是因为渲染一屏消息通常涉及十几个发言者；实测 166 个 username 一次查询约 8 ms。
+  入参自动去空去重、单次上限 200，返回 `missing` 便于调用方降级；`avatars` 表尚未由
+  ETL 建立时返回空 Map 而不是抛错。
+- 消息类工具（`search_wechat_messages` / `get_messages_by_date` / `get_messages_by_range` /
+  `search_shared_files` / `get_session_history`）的返回项新增 `sender_username` 字段：
+  原先只有 `sender_name`（昵称，无昵称时才是 username），无法按 username 反查头像。
+  纯新增字段，向后兼容。
+
+### ETL 健壮性
+
+- **派生表版本未计入指纹的隐患**：`_migrate_derived_tables` 会在派生表版本变化时
+  `DROP` 派生表，但 `compute_fingerprint` 只看 `ETL_SCHEMA_VERSION` + 源库 mtime/大小；
+  指纹不变时 `sync_data` 会直接返回 `skipped`，派生表被删掉后再也不会重建。现把
+  `DERIVED_SCHEMA_VERSION` 一并计入指纹，任何派生表结构升级都会强制走一次重建。
+
 ## 新增 MCP 工具（绿泡泡侧 6 → 15 个，全部只读）
 
 | 工具 | 说明 |

@@ -39,12 +39,12 @@ def _check_db_initialized() -> Optional[str]:
             conn.close()
             return "绿泡泡数据库存在但数据表未初始化。请在终端运行 `wechat-init --etl-only` 重建索引。"
         # 老版本建的库可能缺少后续新增的表（chatroom_members / media_files /
-        # favorites / emoticons），会让对应工具抛裸 OperationalError。init_schema
+        # favorites / emoticons / avatars），会让对应工具抛裸 OperationalError。init_schema
         # 是幂等的 CREATE TABLE IF NOT EXISTS，这里直接补齐（表为空，需跑 ETL 才有数据）。
         cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
         have = {r[0] for r in cur.fetchall()}
         conn.close()
-        if {"chatroom_members", "media_files", "favorites", "emoticons"} - have:
+        if {"chatroom_members", "media_files", "favorites", "emoticons", "avatars"} - have:
             init_schema()
         return None
     except Exception as e:
@@ -204,6 +204,7 @@ def search_wechat_messages(query: str, session_id: Optional[str] = None, limit: 
             "session_id": r["session_username"],
             "session_name": r["session_name"] or r["session_username"],
             "sender_name": r["sender_name"] or r["sender_username"],
+            "sender_username": r["sender_username"],
             "time": _ts_to_str(r["create_time"]),
             "content": r["content"],
         })
@@ -298,6 +299,7 @@ def get_session_history(session_id: str, limit: int = 50, days: Optional[int] = 
         results.append({
             "id": r["id"],
             "sender_name": r["sender_name"] or r["sender_username"],
+            "sender_username": r["sender_username"],
             "time": _ts_to_str(r["create_time"]),
             "content": r["content"],
         })
@@ -348,6 +350,7 @@ def search_shared_files(keyword: Optional[str] = None, session_id: Optional[str]
             "session_name": r["session_name"] or r["session_username"],
             "session_id": r["session_username"],
             "sender_name": r["sender_name"] or r["sender_username"],
+            "sender_username": r["sender_username"],
             "time": _ts_to_str(r["create_time"]),
             "file_name": r["content"].replace("[文件] ", ""),
         })
@@ -370,6 +373,87 @@ def get_message_image(message_id: int, include_base64: bool = False) -> Dict[str
     if err:
         return {"error": err}
     return get_image_for_message(message_id=message_id, include_base64=include_base64)
+
+
+# 单次头像查询的 username 上限。面板一屏消息通常只涉及十几个发言者，
+# 200 足够覆盖"整群成员头像"这类批量场景，同时挡住超长入参。
+_AVATAR_LOOKUP_LIMIT = 200
+
+
+@mcp.tool()
+@_db_tool
+def get_user_avatars(usernames: List[str]) -> Dict[str, Any]:
+    """批量获取用户 / 群 / 公众号头像的本地图片文件路径。
+
+    头像来自绿泡泡 4.x 的 head_image.db（已由 ETL 落盘为真实图片文件）。
+    只返回**本地绝对路径**，不返回图片内容 —— 供面板等宿主直接读盘渲染，
+    避免把图片塞进大模型上下文。
+
+    一次性批量查询：渲染一屏消息通常涉及十几个发言者，逐个调用开销过大。
+
+    Args:
+        usernames: 用户名列表（wxid / 群号 *@chatroom / 公众号 *@openim），
+                   自动去空去重，最多 200 个
+
+    Returns:
+        {"success": True, "count": 命中数, "avatars": {username: {md5, format,
+        size_bytes, file_path}}, "missing": [未命中或文件已丢失的 username]}
+    """
+    err = _check_db_initialized()
+    if err:
+        return {"error": err}
+
+    # 归一化：去空、去重、限量（保留原顺序，便于调用方对齐）
+    wanted: List[str] = []
+    seen = set()
+    for u in usernames or []:
+        if not isinstance(u, str):
+            continue
+        u = u.strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        wanted.append(u)
+    if not wanted:
+        return {"success": True, "count": 0, "avatars": {}, "missing": []}
+    truncated = len(wanted) > _AVATAR_LOOKUP_LIMIT
+    wanted = wanted[:_AVATAR_LOOKUP_LIMIT]
+
+    conn = get_connection()
+    cur = conn.cursor()
+    avatars: Dict[str, Any] = {}
+    try:
+        placeholders = ",".join("?" for _ in wanted)
+        rows = cur.execute(
+            f"SELECT username, md5, format, size_bytes, file_path "
+            f"FROM avatars WHERE username IN ({placeholders})",
+            wanted,
+        ).fetchall()
+        for r in rows:
+            fp = r["file_path"] or ""
+            # 索引里的文件可能已被用户清理掉，命中但读不到的不算命中
+            if not fp or not Path(fp).exists():
+                continue
+            avatars[r["username"]] = {
+                "md5": r["md5"] or "",
+                "format": r["format"] or "",
+                "size_bytes": r["size_bytes"] or 0,
+                "file_path": fp,
+            }
+    except sqlite3.Error:
+        # avatars 表尚未由 ETL 建立：视为"全部无头像"，由调用方降级到占位色块
+        avatars = {}
+    conn.close()
+
+    res: Dict[str, Any] = {
+        "success": True,
+        "count": len(avatars),
+        "avatars": avatars,
+        "missing": [u for u in wanted if u not in avatars],
+    }
+    if truncated:
+        res["truncated"] = True
+    return res
 
 
 @mcp.tool()
@@ -429,6 +513,7 @@ def get_messages_by_date(date: str, session_id: Optional[str] = None, limit: int
         results.append({
             "session_name": r["session_name"] or r["session_username"],
             "sender_name": r["sender_name"] or r["sender_username"],
+            "sender_username": r["sender_username"],
             "time": _ts_to_str(r["create_time"]),
             "content": r["content"],
         })
@@ -595,6 +680,7 @@ def get_messages_by_range(start: str, end: str, session_id: Optional[str] = None
             "session_id": r["session_username"],
             "session_name": r["session_name"] or r["session_username"],
             "sender_name": r["sender_name"] or r["sender_username"],
+            "sender_username": r["sender_username"],
             "time": _ts_to_str(r["create_time"]),
             "content": r["content"],
         }

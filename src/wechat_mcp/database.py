@@ -7,6 +7,7 @@ import logging
 
 from .config import DB_PATH, get_decrypted_dir
 from .adapters import route_sync
+from .adapters.avatars import sync_avatars_v4
 from .adapters.media import sync_emoticons_v4, sync_favorites_v4, sync_media_v4
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,17 @@ def init_schema():
         );
 
         CREATE INDEX IF NOT EXISTS idx_emoticons_package ON emoticons(package_id);
+
+        CREATE TABLE IF NOT EXISTS avatars (
+            username TEXT PRIMARY KEY,
+            md5 TEXT,
+            format TEXT,
+            size_bytes INTEGER,
+            file_path TEXT,
+            update_time INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_avatars_md5 ON avatars(md5);
     """)
     conn.commit()
     conn.close()
@@ -154,9 +166,9 @@ def init_schema():
 # 否则老用户升级后源库文件未变 -> 指纹一致 -> 直接 skipped，新逻辑永不生效。
 ETL_SCHEMA_VERSION = "5"
 
-# 派生表（media_files / favorites / emoticons）结构版本。这三张表每次 ETL 都会
-# 从源库整体重建，因此结构升级时直接 DROP 重建最安全，不会丢用户数据。
-DERIVED_SCHEMA_VERSION = "1"
+# 派生表（media_files / favorites / emoticons / avatars）结构版本。这些表每次
+# ETL 都会从源库整体重建，因此结构升级时直接 DROP 重建最安全，不会丢用户数据。
+DERIVED_SCHEMA_VERSION = "2"
 
 
 def _migrate_derived_tables(conn) -> None:
@@ -166,7 +178,7 @@ def _migrate_derived_tables(conn) -> None:
     row = cur.fetchone()
     if row and row[0] == DERIVED_SCHEMA_VERSION:
         return
-    for table in ("media_files", "favorites", "emoticons"):
+    for table in ("media_files", "favorites", "emoticons", "avatars"):
         cur.execute(f"DROP TABLE IF EXISTS {table}")
     conn.commit()
     init_schema()
@@ -177,8 +189,12 @@ def _migrate_derived_tables(conn) -> None:
 
 
 def compute_fingerprint(decrypted_dir: Path) -> str:
-    """按 ETL 版本 + 源库文件修改时间与大小计算指纹"""
-    items = [f"etl:{ETL_SCHEMA_VERSION}"]
+    """按 ETL 版本 + 派生表版本 + 源库文件修改时间与大小计算指纹
+
+    派生表版本必须计入：``_migrate_derived_tables`` 会在版本变化时 DROP 派生表，
+    若指纹不变则 sync_data 会直接 skipped，派生表被删掉后再也不会重建。
+    """
+    items = [f"etl:{ETL_SCHEMA_VERSION}", f"derived:{DERIVED_SCHEMA_VERSION}"]
     for p in sorted(decrypted_dir.rglob("*.db")):
         try:
             stat = p.stat()
@@ -203,6 +219,7 @@ def _collect_stats(cur: sqlite3.Cursor) -> dict:
         "media_files": count("media_files"),
         "favorites": count("favorites"),
         "emoticons": count("emoticons"),
+        "avatars": count("avatars"),
     }
 
 
@@ -233,7 +250,7 @@ def sync_data(force: bool = False) -> dict:
     warnings: list = []
     if adapter_used in ("v4", "fallback"):
         for name, fn in (("media", sync_media_v4), ("favorites", sync_favorites_v4),
-                         ("emoticons", sync_emoticons_v4)):
+                         ("emoticons", sync_emoticons_v4), ("avatars", sync_avatars_v4)):
             try:
                 fn(decrypted_dir, cur)
             except Exception as exc:  # noqa: BLE001 - 单个附加库失败不影响主同步
