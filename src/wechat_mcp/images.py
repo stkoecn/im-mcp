@@ -36,6 +36,69 @@ def _find_image_dat_by_md5(md5: str, search_roots: list[Path]) -> Optional[Path]
             return broad[0]
     return None
 
+# ---------------------------------------------------------------------------
+# V2 格式的 XOR 段使用**全局单字节**密钥。
+#
+# ⚠️ 原先按「每个文件」用 tail[-1] ^ 0xD9 推导 —— 这隐含假定明文以 JPEG 的
+#    FF D9 (EOI) 结尾。对 JPEG 成立，但对 PNG/GIF/WebP 等（结尾是 IEND 等）
+#    推出来的密钥是错的，会让整个 XOR 段（图片的绝大部分）变成乱码。
+#    正确做法：从若干 JPEG 缩略图尾部投票推导一次，全局复用。
+# ---------------------------------------------------------------------------
+_XOR_KEY_CACHE: Dict[str, Optional[int]] = {}
+
+
+def _detect_xor_key(img_dir: Path, aes_key: bytes) -> Optional[int]:
+    """从同目录的 JPEG 缩略图（明文尾必为 FF D9）投票推导全局 XOR 密钥。"""
+    cache_key = str(img_dir)
+    if cache_key in _XOR_KEY_CACHE:
+        return _XOR_KEY_CACHE[cache_key]
+
+    from Crypto.Cipher import AES as _AES
+
+    votes: Dict[int, int] = {}
+    try:
+        thumbs = sorted(img_dir.glob("*_t.dat"))[:48]
+    except OSError:
+        thumbs = []
+    for p in thumbs:
+        try:
+            with open(p, "rb") as fp:
+                data = fp.read()
+        except OSError:
+            continue
+        if len(data) < 32 or data[:6] != _V2_MAGIC_FULL:
+            continue
+        _aes_size, xor_size = struct.unpack("<II", data[6:14])
+        if xor_size <= 0:
+            continue
+        try:
+            head = _AES.new(aes_key[:16], _AES.MODE_ECB).decrypt(data[15:31])
+        except Exception:
+            break
+        if head[:3] != b"\xff\xd8\xff":
+            continue
+        k = data[-1] ^ 0xD9
+        votes[k] = votes.get(k, 0) + 1
+
+    result = max(votes, key=votes.get) if votes else None
+    _XOR_KEY_CACHE[cache_key] = result
+    return result
+
+
+def _find_thumbnail_sibling(dat_path: Path) -> Optional[Path]:
+    """同目录下的 <md5>_t.dat 缩略图（解出来是可直接渲染的 JPEG）。"""
+    base = dat_path.name[:-4] if dat_path.name.endswith(".dat") else dat_path.name
+    for suffix in ("_t_W", "_t", "_h"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    for name in (f"{base}_t.dat", f"{base}_t_W.dat"):
+        cand = dat_path.parent / name
+        if cand.exists():
+            return cand
+    return None
+
+
 def decrypt_image_dat(dat_path: Path, aes_key: Optional[bytes] = None) -> Tuple[Optional[bytes], str, Optional[str]]:
     """
     Decrypt a WeChat .dat image file.
@@ -88,14 +151,31 @@ def decrypt_image_dat(dat_path: Path, aes_key: Optional[bytes] = None) -> Tuple[
         tail_xor = data[len(data) - xor_size :]
         
         if tail_xor:
-            # XOR key is usually derived from JPEG tail FF D9
-            xor_key = tail_xor[-1] ^ 0xD9
+            # XOR 密钥是**全局单字节**：优先从同目录 JPEG 缩略图投票推导
+            # （对 PNG/GIF/WebP 也正确）；推不出来才退回老行为
+            # （按本文件尾部 FF D9 推导，只对 JPEG 正确）。
+            xor_key = None
+            if aes_key:
+                xor_key = _detect_xor_key(dat_path.parent, aes_key)
+            if xor_key is None:
+                xor_key = tail_xor[-1] ^ 0xD9
             dec_tail = bytes([b ^ xor_key for b in tail_xor])
         else:
             dec_tail = b""
 
         full_img = dec_aes + raw_mid + dec_tail
-        fmt = "jpg" if full_img.startswith(b"\xff\xd8\xff") else "png" if full_img.startswith(b"\x89PNG") else "bin"
+        if full_img.startswith(b"\xff\xd8\xff"):
+            fmt = "jpg"
+        elif full_img.startswith(b"\x89PNG"):
+            fmt = "png"
+        elif full_img.startswith(b"GIF8"):
+            fmt = "gif"
+        elif full_img.startswith(b"RIFF") and full_img[8:12] == b"WEBP":
+            fmt = "webp"
+        elif full_img.startswith(b"wxgf"):
+            fmt = "wxgf"
+        else:
+            fmt = "bin"
         return full_img, fmt, None
 
     # Case 2: Legacy XOR format (Auto-detect XOR key)
@@ -256,6 +336,15 @@ def get_image_for_message(message_id: int, include_base64: bool = False) -> Dict
             "dat_path": str(dat_file),
             "hint": "If this is a WeChat 4.x V2 image, please open 1-2 images in WeChat client to load the key into memory, then run image key extraction."
         }
+
+    # 3.5 原图若是 wxgf 私有容器（内含 HEVC，需微信原生解码器才能出图，宿主无法直接渲染），
+    #     回退到同目录的 <md5>_t.dat 缩略图 —— 它是可直接渲染的 JPEG。
+    if img_bytes[:4] == b"wxgf":
+        thumb = _find_thumbnail_sibling(dat_file)
+        if thumb is not None:
+            t_bytes, t_fmt, t_err = decrypt_image_dat(thumb, aes_key=image_aes_key)
+            if not t_err and t_bytes[:3] == b"\xff\xd8\xff":
+                img_bytes, fmt = t_bytes, (t_fmt or "jpg")
 
     # 4. Save decrypted image to cache
     output_dir = USER_WECHAT_DIR / "images"
