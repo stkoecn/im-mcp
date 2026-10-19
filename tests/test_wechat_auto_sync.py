@@ -219,6 +219,9 @@ class _FakeProc:
 
     pid = 424242
 
+    def poll(self):
+        return None
+
 
 class TestManualSyncWorker(unittest.TestCase):
     """手动同步（start_sync / _sync_worker / 独立进程心跳）的关键不变量。
@@ -278,11 +281,29 @@ class TestManualSyncWorker(unittest.TestCase):
 
     def test_start_sync_spawns_detached_worker(self):
         """默认走独立进程（脱离进程树），并如实报告 mode / pid。"""
-        with patch.object(auto_sync, "_spawn_detached_worker", return_value=_FakeProc()):
+        with patch.object(auto_sync, "_spawn_detached_worker", return_value=_FakeProc()), \
+             patch.object(auto_sync, "_load_sync_state", return_value={"pid": _FakeProc.pid}), \
+             patch.object(auto_sync, "_pid_alive", return_value=True):
             res = auto_sync.start_sync()
         self.assertTrue(res["started"])
         self.assertEqual(res["mode"], "detached")
         self.assertEqual(res["pid"], _FakeProc.pid)
+
+    def test_start_sync_reports_failure_when_worker_dies(self):
+        """Popen 成功但 worker 未写出心跳 → 必须返回 started=false 并清掉残留。
+
+        真实故障（2026-10-19 实测）：短连接宿主会在 MCP 进程退出时终止 worker，
+        状态文件永不更新；旧实现只看到 Popen 成功就返回 started=true，调用方
+        只能干等超时。这里固定新的失败语义。
+        """
+        with patch.object(auto_sync, "_spawn_detached_worker", return_value=_FakeProc()), \
+             patch.object(auto_sync, "_load_sync_state", return_value=None), \
+             patch.object(auto_sync, "WORKER_STARTUP_GRACE_SECONDS", 0.05):
+            res = auto_sync.start_sync()
+        self.assertFalse(res["started"])
+        self.assertEqual(res["mode"], "detached")
+        self.assertIn("未能存活", res["error"])
+        self.assertFalse(self.sync_state.exists())
 
     def test_start_sync_falls_back_to_thread_when_spawn_fails(self):
         """spawn 受限（沙箱 / 受限客户端）时必须回退线程，而不是直接失败。"""
@@ -334,7 +355,9 @@ class TestManualSyncWorker(unittest.TestCase):
             started_at=time.time() - (auto_sync.SYNC_STALE_SECONDS + 10),
             heartbeat_at=time.time() - (auto_sync.SYNC_HEARTBEAT_STALE_SECONDS + 10),
         )
-        with patch.object(auto_sync, "_spawn_detached_worker", return_value=_FakeProc()):
+        with patch.object(auto_sync, "_spawn_detached_worker", return_value=_FakeProc()), \
+             patch.object(auto_sync, "_load_sync_state", return_value={"pid": _FakeProc.pid}), \
+             patch.object(auto_sync, "_pid_alive", return_value=True):
             res = auto_sync.start_sync()
         self.assertTrue(res["started"])
         self.assertNotIn("already_running", res)

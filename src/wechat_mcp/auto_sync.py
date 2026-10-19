@@ -60,6 +60,9 @@ SYNC_STATE_FILE = USER_WECHAT_DIR / "sync_state.json"
 # 心跳写入间隔 / 心跳过期阈值（过期且进程已退出即视为僵死）
 SYNC_HEARTBEAT_SECONDS = 5
 SYNC_HEARTBEAT_STALE_SECONDS = 90
+# 独立进程启动宽限期：等它写出第一份心跳；超过即认定未能存活（宿主可能在 MCP 退出时
+# 终止其子进程），start_sync 会清理残留并返回 started=false，让调用方回退阻塞同步。
+WORKER_STARTUP_GRACE_SECONDS = 3.0
 _lock = threading.RLock()
 
 
@@ -458,32 +461,52 @@ def _spawn_detached_worker(force: bool, redecrypt: bool) -> Optional[subprocess.
         cmd.append("--no-redecrypt")
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
+    # worker 的 stdout/stderr 落盘：DEVNULL 会把启动期异常完全吞掉，出问题时
+    # 只看到「started=true 但状态永不更新」，无法判断是启动失败还是被宿主终止。
+    log_path = os.path.join(str(USER_WECHAT_DIR), "sync_worker.log")
+    try:
+        log_fh = open(log_path, "ab")
+    except OSError:
+        log_fh = subprocess.DEVNULL
     kwargs: Dict[str, Any] = {
         "cwd": str(USER_WECHAT_DIR.parent),
         "env": env,
         # MCP 走 stdio 传 JSON-RPC：绝不能继承管道，也不能把输出混进协议流
         "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
+        "stdout": log_fh,
+        "stderr": subprocess.STDOUT,
     }
+
+    def _spawn(flags: int, extra: Optional[Dict[str, Any]] = None) -> subprocess.Popen:
+        proc = subprocess.Popen(cmd, creationflags=flags, **kwargs, **(extra or {}))
+        # 句柄必须活到子进程启动完成；挂在 proc 上避免被 GC 提前关闭
+        proc._log_fh = log_fh  # type: ignore[attr-defined]
+        return proc
+
     if os.name == "nt":
         DETACHED_PROCESS = 0x00000008
         CREATE_NEW_PROCESS_GROUP = 0x00000200
         CREATE_BREAKAWAY_FROM_JOB = 0x01000000
         base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
         try:
-            return subprocess.Popen(cmd, creationflags=base | CREATE_BREAKAWAY_FROM_JOB, **kwargs)
+            return _spawn(base | CREATE_BREAKAWAY_FROM_JOB)
         except OSError as exc:
             logger.warning(f"breakaway 启动失败（{exc}），退回不带 breakaway 的 detached")
             try:
-                return subprocess.Popen(cmd, creationflags=base, **kwargs)
+                proc = _spawn(base)
+                proc._spawn_breakaway_error = str(exc)  # type: ignore[attr-defined]
+                return proc
             except OSError as exc2:
                 logger.warning(f"独立同步进程启动失败：{exc2}")
+                if log_fh is not subprocess.DEVNULL:
+                    log_fh.close()
                 return None
     try:
-        return subprocess.Popen(cmd, start_new_session=True, **kwargs)
+        return _spawn(0, {"start_new_session": True})
     except OSError as exc:
         logger.warning(f"独立同步进程启动失败：{exc}")
+        if log_fh is not subprocess.DEVNULL:
+            log_fh.close()
         return None
 
 
@@ -517,11 +540,36 @@ def start_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
 
     proc = _spawn_detached_worker(force, redecrypt)
     if proc is not None:
+        # Popen 成功 ≠ 同步在跑。部分宿主（实测 Snow App 的短连接）会在 MCP 进程退出时
+        # 终止其子进程；此时状态文件永不更新，调用方只能干等超时。这里等 worker 写出心跳，
+        # 并用**心跳里的 pid** 校验存活 —— 它可能不是 Popen 的 pid（uv 的 python.exe 是启动器，
+        # 真实 worker 是它的子进程）。失败则清理残留并明确返回 started=false，让调用方回退阻塞同步。
+        deadline = time.time() + WORKER_STARTUP_GRACE_SECONDS
+        while time.time() < deadline:
+            time.sleep(0.3)
+            st = _load_sync_state()
+            pid = (st or {}).get("pid")
+            if isinstance(pid, int) and _pid_alive(pid):
+                return {
+                    "started": True,
+                    "mode": "detached",
+                    "pid": pid,
+                    "note": "同步已在独立进程开始（重新解密 + 重建索引），用 get_auto_sync_status 查看结果。",
+                }
+        tail = ""
+        try:
+            with open(os.path.join(str(USER_WECHAT_DIR), "sync_worker.log"), "rb") as f:
+                tail = f.read().decode("utf-8", "replace")[-1200:]
+        except OSError:
+            pass
+        _clear_sync_state()
         return {
-            "started": True,
+            "started": False,
             "mode": "detached",
-            "pid": proc.pid,
-            "note": "同步已在独立进程开始（重新解密 + 重建索引），用 get_auto_sync_status 查看结果。",
+            "error": "独立同步进程未能存活（宿主可能在 MCP 退出时终止了子进程）",
+            "hint": "请改用阻塞同步 sync_wechat_database（本机实测约 72s）。",
+            "exit_code": proc.poll(),
+            "log_tail": tail,
         }
 
     # 回退：进程内后台线程（长连接宿主，或 spawn 受限的环境）
