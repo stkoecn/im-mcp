@@ -82,22 +82,30 @@ def get_files_root() -> Path | None:
 
     appdata = os.environ.get("APPDATA", "")
     config_dir = Path(appdata) / "Tencent" / "xwechat" / "config"
-    if not config_dir.is_dir():
-        return None
+
+    roots: list[Path] = []
+    if config_dir.is_dir():
+        for ini_file in sorted(config_dir.glob("*.ini")):
+            content = ""
+            # utf-8-sig 优先：微信的 ini 可能带 BOM，带 BOM 时 strip() 去不掉，会导致路径判空
+            for enc in ("utf-8-sig", "utf-8", "gbk"):
+                try:
+                    content = ini_file.read_text(encoding=enc).strip()[:1024]
+                    break
+                except (UnicodeDecodeError, OSError):
+                    continue
+            if content and Path(content).is_dir():
+                roots.append(Path(content))
+
+    # 回退：新版客户端（4.x）的 ini 可能只写「MyDocument:」这类标记而非绝对路径，
+    # 单靠 ini 无法定位数据目录；此时改用系统默认「文档」目录（xwechat_files 所在处）。
+    doc_root = Path.home() / "Documents"
+    if doc_root.is_dir() and doc_root not in roots:
+        roots.append(doc_root)
 
     candidates = []
-    for ini_file in sorted(config_dir.glob("*.ini")):
-        content = ""
-        # utf-8-sig 优先：微信的 ini 可能带 BOM，带 BOM 时 strip() 去不掉，会导致路径判空
-        for enc in ("utf-8-sig", "utf-8", "gbk"):
-            try:
-                content = ini_file.read_text(encoding=enc).strip()[:1024]
-                break
-            except (UnicodeDecodeError, OSError):
-                continue
-        if not content or not Path(content).is_dir():
-            continue
-        for match in Path(content).glob("xwechat_files/*/db_storage"):
+    for root in roots:
+        for match in root.glob("xwechat_files/*/db_storage"):
             if match.is_dir():
                 candidates.append(match.parent)
 

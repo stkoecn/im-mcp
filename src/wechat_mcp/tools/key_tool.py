@@ -1413,7 +1413,8 @@ def auto_detect_db_dir() -> str | None:
         if os.path.isdir(config_dir):
             for ini_file in glob.glob(os.path.join(config_dir, "*.ini")):
                 content = None
-                for enc in ("utf-8", "gbk"):
+                # utf-8-sig 优先：ini 可能带 BOM，BOM 会让 strip() 后的路径判空
+                for enc in ("utf-8-sig", "utf-8", "gbk"):
                     try:
                         with open(ini_file, "r", encoding=enc) as f:
                             content = f.read(1024).strip()
@@ -1422,6 +1423,12 @@ def auto_detect_db_dir() -> str | None:
                         continue
                 if content and os.path.isdir(content):
                     data_roots.append(content)
+
+        # 回退：新版客户端（4.x）的 ini 可能只写「MyDocument:」这类标记而非绝对路径，
+        # 单靠 ini 无法定位数据目录；此时改用系统默认「文档」目录（xwechat_files 所在处）。
+        doc_root = os.path.join(os.path.expanduser("~"), "Documents")
+        if os.path.isdir(doc_root) and doc_root not in data_roots:
+            data_roots.append(doc_root)
 
         for root in data_roots:
             for match in glob.glob(os.path.join(root, "xwechat_files", "*", "db_storage")):
