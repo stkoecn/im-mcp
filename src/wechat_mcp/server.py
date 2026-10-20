@@ -183,6 +183,44 @@ _BASE_TYPE_MASK = 4294967295  # 低 32 位：基础消息类型
 # 它不是一个「成员」，所有发言人维度都要排除；但这些消息本身仍计入消息总量与类型分布。
 _SELF_SENDER_FILTER = "COALESCE(m.sender_username, '') <> COALESCE(m.session_username, '')"
 
+# ---------------------------------------------------------------------------
+# 撤回统计：撤回提示消息的 sender_username 是**群自身**（session_username），
+# 不是被撤回人 —— 所以不能按发言人归属，必须从正文解析被撤回人。
+# 旧口径用 `content LIKE '%撤回%'` 按发言人统计，实际算的是「谁在聊天里提到过撤回」
+# （实测：某群当天 57 条真实撤回提示全部归属不明，冠军却是一位只提过 3 次的成员，
+#  且因为阈值是 >0，他会在榜单上永远霸榜）。
+# ---------------------------------------------------------------------------
+_RECALL_NOTICE_RE = re.compile(r'^["“](.+?)["”]\s*撤回了一条消息')
+
+
+def _recall_counts(cur: sqlite3.Cursor, where_sql: str, params: List[Any]) -> Counter:
+    """按「被撤回人显示名」统计撤回次数（同名会合并，与「被引用榜」同一限制）。
+
+    只认系统消息（基础类型 10000/10002）里的撤回提示，避免把正常聊天里提到
+    「撤回」二字的发言也算进来。注意这里**不能**套 ``_SELF_SENDER_FILTER``：
+    撤回提示恰恰是群自身发的，套上就一条都统计不到。
+    """
+    rows = cur.execute(
+        f"""
+        SELECT m.content AS content
+        FROM messages m
+        WHERE {where_sql}
+          AND ((m.local_type & {_BASE_TYPE_MASK}) IN (10000, 10002))
+          AND m.content LIKE '%撤回%'
+        """,
+        params,
+    ).fetchall()
+    out: Counter = Counter()
+    for row in rows:
+        content = (row["content"] or "").strip()
+        match = _RECALL_NOTICE_RE.match(content)
+        if match:
+            name = match.group(1).strip()
+            if name:
+                out[name] += 1
+        # 「你撤回了一条消息」= 本机账号撤回，正文里没有昵称，保守跳过（不计入任何成员）
+    return out
+
 
 def _range_where(
     cur: sqlite3.Cursor,
@@ -245,7 +283,9 @@ def _member_aggregate(
                SUM(CASE WHEN (m.local_type & {_BASE_TYPE_MASK}) = 43 OR (m.local_type >> 32) = 4 THEN 1 ELSE 0 END) AS videos,
                SUM(CASE WHEN (m.local_type & {_BASE_TYPE_MASK}) = 47 OR (m.local_type >> 32) = 8 THEN 1 ELSE 0 END) AS emojis,
                SUM(CASE WHEN (m.local_type >> 32) = 57 THEN 1 ELSE 0 END) AS quotes_given,
-               SUM(CASE WHEN m.content LIKE '%撤回%' THEN 1 ELSE 0 END) AS recall_like_events,
+               -- 撤回次数不在这里算：撤回提示的发送者是群自身，按发言人归属永远取不到，
+               -- 改由 _recall_counts() 从正文解析被撤回人后在 _member_payload 里注入。
+               0 AS recall_like_events,
                SUM(CASE WHEN CAST(strftime('%H', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) AS INTEGER) < 6 THEN 1 ELSE 0 END) AS night,
                SUM(CASE WHEN CAST(strftime('%H', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) AS INTEGER) BETWEEN 6 AND 8 THEN 1 ELSE 0 END) AS early,
                MIN(m.create_time) AS first_time,
@@ -453,10 +493,18 @@ def _system_events(
     params: List[Any],
     total: int,
 ) -> Dict[str, Any]:
-    """系统事件：撤回类消息与系统提示消息的数量/占比。"""
+    """系统事件：撤回类消息与系统提示消息的数量/占比。
+
+    撤回口径与成员维度对齐：只认系统消息类型（10000 / 10002）里内容为
+    「…撤回了一条消息」的提示，**不再用裸 LIKE '%撤回%'** —— 后者会把任何
+    提到「撤回」二字的正常聊天算进来（实测 recall_like_count 57 >
+    system_message_count 52 就是这么来的）。限定类型后，撤回数必然是
+    系统消息的子集。
+    """
     row = cur.execute(
         f"""
-        SELECT SUM(CASE WHEN m.content LIKE '%撤回%' THEN 1 ELSE 0 END) AS recalls,
+        SELECT SUM(CASE WHEN (m.local_type & {_BASE_TYPE_MASK}) IN (10000, 10002)
+                          AND m.content LIKE '%撤回了一条消息%' THEN 1 ELSE 0 END) AS recalls,
                SUM(CASE WHEN (m.local_type & {_BASE_TYPE_MASK}) IN (10000, 10002) THEN 1 ELSE 0 END) AS system_messages,
                SUM(CASE WHEN COALESCE(m.sender_username, '') = COALESCE(m.session_username, '') THEN 1 ELSE 0 END) AS group_self_messages
         FROM messages m WHERE {where_sql}
@@ -493,18 +541,22 @@ def _member_payload(
     top_n: int,
     quoted: Optional[Counter] = None,
     bursts: Optional[Dict[str, int]] = None,
+    recalls: Optional[Counter] = None,
 ) -> tuple:
     """把聚合行转成可消费的成员列表，并给出各维度领跑者。
 
-    被引用次数只能按显示名匹配（引用消息不含稳定 ID），同名用户会合并计数。
+    被引用次数与撤回次数都只能按显示名匹配（引用 / 撤回提示不含稳定 ID），
+    同名用户会合并计数。
     """
     quoted = quoted or Counter()
     bursts = bursts or {}
+    recalls = recalls or Counter()
     members: List[Dict[str, Any]] = []
     for row in rows:
         item = dict(row)
         item["quoted"] = int(quoted.get(item.get("name") or "", 0))
         item["bursts"] = int(bursts.get(item.get("u"), 0))
+        item["recall_like_events"] = int(recalls.get(item.get("name") or "", 0))
         members.append(item)
 
     def leaders(field: str, size: int = 3) -> List[Dict[str, Any]]:
@@ -1721,8 +1773,9 @@ def _activity_stats_payload(
     member_rows = _member_aggregate(cur, where_sql, params, divisor)
     bursts = _member_bursts(cur, where_sql, params, divisor)
     quote_payload, quoted_counter = _quote_network(cur, where_sql, params, top_n)
+    recalls = _recall_counts(cur, where_sql, params)
     member_rank, member_leaders = _member_payload(
-        member_rows, top_n, quoted_counter, bursts
+        member_rows, top_n, quoted_counter, bursts, recalls
     )
     concentration = _concentration([dict(row) for row in member_rows], top_n)
     silent = _silent_members(cur, where_sql, params, session_id, top_n)
@@ -1963,7 +2016,6 @@ def get_member_profile(
                SUM(CASE WHEN (m.local_type & {_BASE_TYPE_MASK}) = 43 OR (m.local_type >> 32) = 4 THEN 1 ELSE 0 END) AS videos,
                SUM(CASE WHEN (m.local_type & {_BASE_TYPE_MASK}) = 47 OR (m.local_type >> 32) = 8 THEN 1 ELSE 0 END) AS emojis,
                SUM(CASE WHEN (m.local_type >> 32) = 57 THEN 1 ELSE 0 END) AS quotes_given,
-               SUM(CASE WHEN m.content LIKE '%撤回%' THEN 1 ELSE 0 END) AS recall_like_events,
                SUM(CASE WHEN CAST(strftime('%H', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) AS INTEGER) < 6 THEN 1 ELSE 0 END) AS night,
                SUM(CASE WHEN CAST(strftime('%H', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) AS INTEGER) BETWEEN 6 AND 8 THEN 1 ELSE 0 END) AS early
         FROM messages m WHERE {scope_where}
@@ -1974,6 +2026,9 @@ def get_member_profile(
     if not summary or not summary["messages"]:
         conn.close()
         return {"error": f"{display_name} 在指定范围内没有消息记录"}
+
+    # 撤回次数：从撤回提示正文解析被撤回人（这类提示的发送者是群自身，不属于该成员的发言）
+    recall_count = int(_recall_counts(cur, where_sql, params).get(display_name, 0))
 
     hourly = cur.execute(
         f"""
@@ -2091,7 +2146,7 @@ def get_member_profile(
         "rhythm": {
             "night_messages": int(summary["night"] or 0),
             "early_messages": int(summary["early"] or 0),
-            "recall_like_events": int(summary["recall_like_events"] or 0),
+            "recall_like_events": recall_count,
             "bursts": int(burst_row["n"] or 0) if burst_row else 0,
         },
         "hourly_distribution": {r["h"]: r["n"] for r in hourly},
