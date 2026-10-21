@@ -238,8 +238,27 @@ def _member_aggregate(
         SELECT m.sender_username AS u,
                COALESCE(NULLIF(c.display_name, ''), m.sender_username) AS name,
                COUNT(*) AS messages,
-               COALESCE(SUM(LENGTH(COALESCE(m.content, ''))), 0) AS chars,
-               COALESCE(MAX(LENGTH(COALESCE(m.content, ''))), 0) AS longest,
+               -- 只算「自己说的话」：引用消息的 content 形如
+               --   "[引用 某某: 被引原文] 自己的回复"
+               -- 直接把 LENGTH(content) 求和会把被引原文也算进作者字数 ——
+               -- 实测某成员 104 条里 67 条是引用，6605 字中约 2480 字是别人的。
+               -- 这里剥掉第一个 ']' 及其之前的部分（引用前缀），ltrim 去掉残留空格。
+               COALESCE(SUM(
+                 CASE
+                   WHEN (m.local_type >> 32) = 57 AND instr(COALESCE(m.content, ''), ']') > 0
+                     THEN LENGTH(ltrim(substr(m.content, instr(m.content, ']') + 1)))
+                   ELSE LENGTH(COALESCE(m.content, ''))
+                 END
+               ), 0) AS chars,
+               -- 原值保留：用来区分「自己输出多」与「搬运引用的多」
+               COALESCE(SUM(LENGTH(COALESCE(m.content, ''))), 0) AS chars_total,
+               COALESCE(MAX(
+                 CASE
+                   WHEN (m.local_type >> 32) = 57 AND instr(COALESCE(m.content, ''), ']') > 0
+                     THEN LENGTH(ltrim(substr(m.content, instr(m.content, ']') + 1)))
+                   ELSE LENGTH(COALESCE(m.content, ''))
+                 END
+               ), 0) AS longest,
                SUM(CASE WHEN (m.local_type & {_BASE_TYPE_MASK}) = 3 OR (m.local_type >> 32) = 3 THEN 1 ELSE 0 END) AS images,
                SUM(CASE WHEN (m.local_type >> 32) = 6 THEN 1 ELSE 0 END) AS files,
                SUM(CASE WHEN (m.local_type & {_BASE_TYPE_MASK}) = 43 OR (m.local_type >> 32) = 4 THEN 1 ELSE 0 END) AS videos,
@@ -248,6 +267,9 @@ def _member_aggregate(
                SUM(CASE WHEN m.content LIKE '%撤回%' THEN 1 ELSE 0 END) AS recall_like_events,
                SUM(CASE WHEN CAST(strftime('%H', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) AS INTEGER) < 6 THEN 1 ELSE 0 END) AS night,
                SUM(CASE WHEN CAST(strftime('%H', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) AS INTEGER) BETWEEN 6 AND 8 THEN 1 ELSE 0 END) AS early,
+               -- 早起冠军用：早晨 6-8 点之间「最早那条发言」的时刻（秒），没在早晨说过话则为 NULL。
+               -- 与 early（条数）区分 —— 比条数只能得出「谁早晨话多」，不是「谁起得早」。
+               MIN(CASE WHEN CAST(strftime('%H', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime')) AS INTEGER) BETWEEN 6 AND 8 THEN m.create_time / {divisor} END) AS early_first,
                MIN(m.create_time) AS first_time,
                MAX(m.create_time) AS last_time
         FROM messages m
@@ -378,7 +400,9 @@ def _silent_members(
         FROM chatroom_members cm
         WHERE cm.chatroom_username = ?
           AND cm.member_username NOT IN (
-              SELECT DISTINCT m.sender_username FROM messages m WHERE {where_sql}
+              -- 与上面的 silent_total 必须同口径：漏掉 _SELF_SENDER_FILTER 会让
+              -- 「沉默人数」与「沉默名单」在群自身也算成员时对不上。
+              SELECT DISTINCT m.sender_username FROM messages m WHERE {where_sql} AND {_SELF_SENDER_FILTER}
           )
         ORDER BY name
         LIMIT ?
@@ -507,19 +531,46 @@ def _member_payload(
         item["bursts"] = int(bursts.get(item.get("u"), 0))
         members.append(item)
 
-    def leaders(field: str, size: int = 3) -> List[Dict[str, Any]]:
-        ordered = sorted(members, key=lambda m: m.get(field) or 0, reverse=True)
-        return [
-            {"username": m["u"], "display_name": m["name"], "value": m[field]}
-            for m in ordered[:size]
-            if (m.get(field) or 0) > 0
-        ]
+    def leaders(field: str, size: int = 3, reverse: bool = True) -> List[Dict[str, Any]]:
+        """各维度 Top-N（只计 >0 的成员，size 按「真实上榜人数」计）。
+
+        并列时以 username 作次键，保证结果**确定性且与消息数无关** —— 此前用
+        Python 稳定排序，并列会继承 members 的 ``ORDER BY messages DESC`` 顺序，
+        等于「谁话多谁当冠军」。实测：全群仅 2 条视频时，两名各 1 条视频的
+        成员由消息数决定谁被封「视频UP主」，且结果永远固定为同一人。
+        """
+        rows = [m for m in members if (m.get(field) or 0) > 0]
+        if reverse:
+            rows.sort(key=lambda m: (-(m.get(field) or 0), str(m.get("u") or "")))
+        else:
+            rows.sort(key=lambda m: (m.get(field) or 0, str(m.get("u") or "")))
+        out: List[Dict[str, Any]] = []
+        for idx, m in enumerate(rows[:size]):
+            item: Dict[str, Any] = {
+                "username": m["u"],
+                "display_name": m["name"],
+                "value": m[field],
+            }
+            # 与下一名同值即为并列：冠军不唯一，面板据此不颁发称号
+            nxt = rows[idx + 1] if idx + 1 < len(rows) else None
+            item["tied"] = bool(nxt is not None and (nxt.get(field) or 0) == (m.get(field) or 0))
+            if field == "early_first":
+                # 时间戳对调用方不直观，附带 HH:MM 供直接展示
+                try:
+                    item["label"] = datetime.datetime.fromtimestamp(int(m[field])).strftime("%H:%M")
+                except (ValueError, OSError, OverflowError):
+                    item["label"] = ""
+            out.append(item)
+        return out
 
     leader_fields = (
         "messages", "chars", "images", "videos", "emojis",
         "quotes_given", "quoted", "recall_like_events", "night", "early", "bursts",
     )
-    return members[:top_n], {field: leaders(field) for field in leader_fields}
+    result = {field: leaders(field) for field in leader_fields}
+    # 早起冠军：按时刻升序（最早者在前），与 early（6-8 点条数）语义不同
+    result["early_first"] = leaders("early_first", reverse=False)
+    return members[:top_n], result
 
 
 def _dedupe_phrases(phrases, min_count: int = 3, scan: int = 200, limit: int = 20) -> List[Dict[str, Any]]:
@@ -1745,7 +1796,10 @@ def _activity_stats_payload(
         for row in type_rows
     ]
 
-    # 日趋势：在原始按天计数上补 7 日移动平均与日环比（纯派生数据）。
+    # 日趋势：在原始按天计数上补移动平均与日环比（纯派生数据）。
+    # ⚠️ ma7 的窗口是「截至当天的最近 7 天」——范围不足 7 天时窗口会变短，
+    # 单日范围下 ma7 就等于当天值（并非真正的 7 日均值）。窗口长度用
+    # ma7_days 显式给出，调用方据此判断该值是否可信，不要盲当 7 日均值用。
     daily_trend = []
     for i, row in enumerate(daily):
         window = [r["n"] for r in daily[max(0, i - 6): i + 1]]
@@ -1755,6 +1809,7 @@ def _activity_stats_payload(
             "date": row["d"],
             "messages": count,
             "ma7": round(sum(window) / len(window), 1),
+            "ma7_days": len(window),
             "dod_pct": round((count - prev) / prev * 100, 1) if prev else None,
         })
 
@@ -1770,7 +1825,12 @@ def _activity_stats_payload(
         "daily_distribution": {r["d"]: r["n"] for r in daily},
         "daily_unique_senders": {r["d"]: r["n"] for r in daily_unique},
         "daily_trend": daily_trend,
-        "sender_buckets": {r["bucket"]: r["n"] for r in sender_buckets},
+        # 固定桶序（含缺失桶补 0）：SQL GROUP BY 的返回顺序不保证，直接转 dict
+        # 会让面板把「50+」渲染在最前面之类的错乱。
+        "sender_buckets": {
+            _b: {r["bucket"]: r["n"] for r in sender_buckets}.get(_b, 0)
+            for _b in ("1", "2-9", "10-49", "50+")
+        },
         "weekday_hourly": [
             {"weekday": int(r["w"]), "hour": r["h"], "count": r["n"]} for r in weekday_hourly
         ],
@@ -1953,8 +2013,23 @@ def get_member_profile(
     summary = cur.execute(
         f"""
         SELECT COUNT(*) AS messages,
-               COALESCE(SUM(LENGTH(COALESCE(m.content, ''))), 0) AS chars,
-               COALESCE(MAX(LENGTH(COALESCE(m.content, ''))), 0) AS longest,
+               -- 与 _member_aggregate 同口径：引用消息只算「自己回复的那部分」，
+               -- 否则被引原文会被算进本人字数（称号「话痨之王」会失真）。
+               COALESCE(SUM(
+                 CASE
+                   WHEN (m.local_type >> 32) = 57 AND instr(COALESCE(m.content, ''), ']') > 0
+                     THEN LENGTH(ltrim(substr(m.content, instr(m.content, ']') + 1)))
+                   ELSE LENGTH(COALESCE(m.content, ''))
+                 END
+               ), 0) AS chars,
+               COALESCE(SUM(LENGTH(COALESCE(m.content, ''))), 0) AS chars_total,
+               COALESCE(MAX(
+                 CASE
+                   WHEN (m.local_type >> 32) = 57 AND instr(COALESCE(m.content, ''), ']') > 0
+                     THEN LENGTH(ltrim(substr(m.content, instr(m.content, ']') + 1)))
+                   ELSE LENGTH(COALESCE(m.content, ''))
+                 END
+               ), 0) AS longest,
                MIN(m.create_time) AS first_time,
                MAX(m.create_time) AS last_time,
                COUNT(DISTINCT strftime('%Y-%m-%d', datetime(m.create_time / {divisor}, 'unixepoch', 'localtime'))) AS active_days,
@@ -2039,8 +2114,10 @@ def get_member_profile(
         """,
         scope_params + [60 * divisor],
     ).fetchone()
+    # 分母必须与分子同口径：messages（分子）只含该成员的发言、天然不含群自身，
+    # 若分母把系统消息算进来，占位比会被系统性压低。
     total_in_scope = cur.execute(
-        f"SELECT COUNT(*) FROM messages m WHERE {where_sql}", params
+        f"SELECT COUNT(*) FROM messages m WHERE {where_sql} AND {_SELF_SENDER_FILTER}", params
     ).fetchone()[0]
     # 原文样本（可选）：让 Agent 一次拿到「画像 + 该成员近期发言」，不必再翻整个群
     sample_limit = _clamp(include_samples, 0, 200)
@@ -2073,7 +2150,10 @@ def get_member_profile(
         "time_range": {"start": start, "end": end} if (start and end) else None,
         "summary": {
             "messages": messages,
+            # chars = 自己说的话（已剥掉引用前缀）；chars_total = 含被引原文的总长度。
+            # 两者差得越多，说明这个人越偏向「搬运 / 转引」而不是自己输出。
             "chars": chars,
+            "chars_total": int(summary["chars_total"] or 0),
             "avg_length": round(chars / messages, 1) if messages else 0.0,
             "longest": int(summary["longest"] or 0),
             "first_time": _ts_to_str(summary["first_time"]),
