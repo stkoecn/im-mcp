@@ -161,6 +161,42 @@ class TestWeChatTimeQueries(unittest.TestCase):
         self.assertEqual(server.get_messages_by_date("2024-05-20"), [])
         self.assertEqual(server.get_messages_by_range("2024-05-20", "2024-05-21"), [])
 
+    def test_messages_since_time_only_does_not_skip_same_second(self):
+        """回归：只用 after_time 续拉时，同一秒超过一页的消息不能被永久跳过。"""
+        for unit in (1, 1000):
+            with self.subTest(unit=unit):
+                self.seed_messages(unit)
+                first = server.get_messages_since(
+                    after_time="2024-05-20 12:00:00", session_id="room-a", limit=1
+                )
+                self.assertGreaterEqual(first["count"], 1)
+                second = server.get_messages_since(
+                    after_time=first["next_time"], session_id="room-a", limit=10
+                )
+                contents = {row["content"] for row in first["messages"] + second["messages"]}
+                # 允许重复（时间游标是含语义），但绝不能丢。
+                self.assertTrue({"at-noon-a", "at-noon-b"}.issubset(contents))
+
+    def test_messages_since_composite_cursor_is_exact(self):
+        """回归：after_time + after_id 组成 (create_time, id) 复合游标，不漏也不重。"""
+        for unit in (1, 1000):
+            with self.subTest(unit=unit):
+                self.seed_messages(unit)
+                first = server.get_messages_since(
+                    after_time="2024-05-20 12:00:00", session_id="room-a", limit=1
+                )
+                second = server.get_messages_since(
+                    after_time=first["next_time"],
+                    after_id=first["next_cursor"],
+                    session_id="room-a",
+                    limit=10,
+                )
+                first_ids = {row["id"] for row in first["messages"]}
+                second_ids = {row["id"] for row in second["messages"]}
+                self.assertFalse(first_ids & second_ids)
+                contents = {row["content"] for row in first["messages"] + second["messages"]}
+                self.assertTrue({"at-noon-a", "at-noon-b"}.issubset(contents))
+
 
 if __name__ == "__main__":
     unittest.main()

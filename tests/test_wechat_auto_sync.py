@@ -402,5 +402,29 @@ class TestManualSyncWorker(unittest.TestCase):
         self.assertFalse(self.sync_state.exists())
 
 
+class TestRefreshAndSyncStatus(unittest.TestCase):
+    """回归：ETL 的业务失败不能被顶层 ok 掩盖。"""
+
+    def test_etl_error_makes_top_level_ok_false(self):
+        with patch.object(
+            auto_sync,
+            "sync_data",
+            return_value={"status": "error", "message": "synthetic ETL failure"},
+        ):
+            res = auto_sync.refresh_and_sync(redecrypt=False)
+        self.assertFalse(res["ok"])
+        self.assertIn("synthetic ETL failure", res["error"])
+
+    def test_etl_skipped_is_still_ok(self):
+        with patch.object(auto_sync, "sync_data", return_value={"status": "skipped"}):
+            res = auto_sync.refresh_and_sync(redecrypt=False)
+        self.assertTrue(res["ok"])
+
+    def test_etl_success_is_ok(self):
+        with patch.object(auto_sync, "sync_data", return_value={"status": "success"}):
+            res = auto_sync.refresh_and_sync(redecrypt=False)
+        self.assertTrue(res["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

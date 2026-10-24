@@ -1334,16 +1334,21 @@ def get_messages_since(
     """增量拉取游标之后的新消息（供面板 / 脚本做增量刷新，避免重复拉全量）。
 
     游标给 ``after_id``（推荐：messages.id 自增序，绝对无重复）或 ``after_time``
-    （'YYYY-MM-DD' 或 'YYYY-MM-DD HH:MM[:SS]'），两者都未提供则报错；
-    同时给出时两个条件同时生效。
+    （'YYYY-MM-DD' 或 'YYYY-MM-DD HH:MM[:SS]'），两者都未提供则报错。
 
-    只向「更新」方向推进：结果按 id 升序返回，``next_cursor`` 是本批最后一条的 id，
-    下次原样回传即可续拉；``next_time`` 是同一位置的可读时间，便于只存时间的调用方。
+    ⚠️ **时间游标是「含」语义（>=），且只能精确到秒**：同一秒内可能有任意多条消息，
+    只用 ``after_time`` 续拉会重复返回该秒已读到的消息（但不会再漏），调用方应按
+    ``next_cursor`` 去重。要「不漏也不重」必须同时传 ``after_time + after_id``，
+    此时按 ``(create_time, id)`` 复合游标推进 —— 这是推荐用法。
+
+    只向「更新」方向推进：给 ``after_time`` 时按 ``(create_time, id)`` 升序返回，
+    只给 ``after_id`` 时按 id 升序返回；``next_cursor`` 是本批最后一条的 id，
+    下次原样回传即可续拉；``next_time`` 是同一位置的可读时间（配合 next_cursor 使用）。
     ``has_more`` 为真表示还有更多未取完（内部多取一条探测，不会漏批）。
 
     Args:
         after_id: 只取 id 大于该值的消息（增量游标）
-        after_time: 只取创建时间晚于该时刻的消息
+        after_time: 时间下界（**含**该时刻；建议与 after_id 一起传）
         session_id: 可选，限定某个群聊或联系人
         limit: 单批条数，默认 200（上限 500）
     """
@@ -1361,14 +1366,16 @@ def get_messages_since(
     if session_id:
         where.append("m.session_username = ?")
         params.append(session_id)
+
+    cursor_id: Optional[int] = None
     if after_id is not None:
         try:
             cursor_id = int(after_id)
         except (TypeError, ValueError):
             conn.close()
             return {"error": "after_id 必须是整数"}
-        where.append("m.id > ?")
-        params.append(cursor_id)
+
+    time_bound: Optional[int] = None
     if (after_time or "").strip():
         try:
             bound = _parse_time_bound(after_time)
@@ -1376,10 +1383,24 @@ def get_messages_since(
             conn.close()
             return {"error": str(exc)}
         max_ts = cur.execute("SELECT max(create_time) FROM messages").fetchone()[0] or 0
-        where.append("m.create_time > ?")
-        params.append(int(bound.timestamp() * _ts_unit(max_ts)))
+        time_bound = int(bound.timestamp() * _ts_unit(max_ts))
+
+    if time_bound is not None and cursor_id is not None:
+        # 复合游标 (create_time, id)：同一秒内继续按 id 推进，既不漏也不重。
+        where.append("(m.create_time > ? OR (m.create_time = ? AND m.id > ?))")
+        params.extend([time_bound, time_bound, cursor_id])
+    elif time_bound is not None:
+        # 只有时间时必须用 >=：旧的严格 > 会让「同一秒内超过一页」的消息永久丢失。
+        where.append("m.create_time >= ?")
+        params.append(time_bound)
+    elif cursor_id is not None:
+        where.append("m.id > ?")
+        params.append(cursor_id)
 
     size = _clamp(limit, 200, 500)
+    # 时间游标必须按时间排序：messages.id 是 ETL 写入序，不保证与 create_time 同序；
+    # 按 id 排序会让「同一秒/更早时间但 id 更大」的消息错位，续拉时被跳过。
+    order_sql = "m.create_time ASC, m.id ASC" if time_bound is not None else "m.id ASC"
     sql = f"""
         SELECT m.id, m.session_username, s.display_name AS session_name,
                m.sender_username, c.display_name AS sender_name,
@@ -1388,7 +1409,7 @@ def get_messages_since(
         LEFT JOIN sessions s ON s.username = m.session_username
         LEFT JOIN contacts c ON c.username = m.sender_username
         WHERE {' AND '.join(where)}
-        ORDER BY m.id ASC LIMIT ?
+        ORDER BY {order_sql} LIMIT ?
     """
     rows = cur.execute(sql, params + [size + 1]).fetchall()
     conn.close()

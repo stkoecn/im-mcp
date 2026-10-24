@@ -178,7 +178,13 @@ def refresh_and_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, A
             out["ok"] = False
             return out
     out["etl_step"] = sync_data(force=force)
-    out["ok"] = True
+    # ETL 自己也可能返回业务失败（如解密目录缺失、表损坏）：不能只看解密是否成功。
+    # 旧实现无条件写 ok=True，会让失败在工具返回、后台 worker 与 last_run 里都显示成成功。
+    etl_status = str((out.get("etl_step") or {}).get("status") or "").lower()
+    out["ok"] = etl_status in ("success", "skipped")
+    if not out["ok"]:
+        reason = (out.get("etl_step") or {}).get("message") or "重建索引失败"
+        out["error"] = str(reason)
     return out
 
 

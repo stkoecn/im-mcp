@@ -84,7 +84,10 @@ def _detect_xor_key(img_dir: Path, aes_key: bytes) -> Optional[int]:
         votes[k] = votes.get(k, 0) + 1
 
     result = max(votes, key=votes.get) if votes else None
-    _XOR_KEY_CACHE[cache_key] = result
+    # 只缓存成功推导：把 None 也缓存会让「首次扫描时同目录还没有 JPEG 缩略图」永久生效，
+    # 之后即使补齐缩略图也不会重试，整目录的 JPEG 都解不出来。
+    if result is not None:
+        _XOR_KEY_CACHE[cache_key] = result
     return result
 
 
@@ -145,10 +148,14 @@ def decrypt_image_dat(dat_path: Path, aes_key: Optional[bytes] = None) -> Tuple[
         try:
             cipher = AES.new(aes_key[:16], AES.MODE_ECB)
             dec_aes = cipher.decrypt(cipher_part)
-            # Remove PKCS7 padding
+            # Remove PKCS7 padding —— 必须校验：错误密钥通常也能得到一个 1..16 的尾字节，
+            # 旧实现只判范围就静默接受，之后只会得到无法识别的垃圾字节。
             pad_len = dec_aes[-1]
-            if 1 <= pad_len <= 16:
-                dec_aes = dec_aes[:-pad_len]
+            if not (1 <= pad_len <= 16):
+                return None, "", "AES decryption failed: invalid PKCS7 padding (wrong image_aes_key?)"
+            if dec_aes[-pad_len:] != bytes([pad_len]) * pad_len:
+                return None, "", "AES decryption failed: PKCS7 padding mismatch (wrong image_aes_key?)"
+            dec_aes = dec_aes[:-pad_len]
         except Exception as e:
             return None, "", f"AES decryption failed: {e}"
 
@@ -164,6 +171,15 @@ def decrypt_image_dat(dat_path: Path, aes_key: Optional[bytes] = None) -> Tuple[
             if aes_key:
                 xor_key = _detect_xor_key(dat_path.parent, aes_key)
             if xor_key is None:
+                # 只有 JPEG 的明文尾才是 FF D9。对 PNG/GIF/WebP 套用这条规则会直接
+                # 改坏尾部字节（而且 fmt 仍能识别出来，表现为「图能开但已损坏」）。
+                if not dec_aes[:3] == b"\xff\xd8\xff":
+                    return (
+                        None,
+                        "",
+                        "Cannot derive the global XOR key: no usable JPEG thumbnail in the same "
+                        "directory, and this file is not a JPEG (refusing the JPEG-tail fallback).",
+                    )
                 xor_key = tail_xor[-1] ^ 0xD9
             dec_tail = bytes([b ^ xor_key for b in tail_xor])
         else:
@@ -181,7 +197,8 @@ def decrypt_image_dat(dat_path: Path, aes_key: Optional[bytes] = None) -> Tuple[
         elif full_img.startswith(b"wxgf"):
             fmt = "wxgf"
         else:
-            fmt = "bin"
+            # 识别不出来 = 密钥错误或文件损坏，不能把垃圾字节当成功结果写进缓存。
+            return None, "", "Decrypted payload is not a recognizable image (wrong key or corrupted file)"
         return full_img, fmt, None
 
     # Case 2: Legacy XOR format (Auto-detect XOR key)
