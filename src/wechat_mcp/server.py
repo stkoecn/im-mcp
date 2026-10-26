@@ -273,7 +273,7 @@ def _member_bursts(
         WITH seq AS (
             SELECT m.sender_username AS u,
                    m.create_time - LAG(m.create_time) OVER (
-                       PARTITION BY m.sender_username ORDER BY m.create_time
+                       PARTITION BY m.sender_username ORDER BY m.create_time, m.id
                    ) AS gap
             FROM messages m WHERE {where_sql} AND {_SELF_SENDER_FILTER}
         )
@@ -366,7 +366,9 @@ def _silent_members(
         SELECT COUNT(*) FROM chatroom_members cm
         WHERE cm.chatroom_username = ?
           AND cm.member_username NOT IN (
-              SELECT DISTINCT m.sender_username FROM messages m WHERE {where_sql} AND {_SELF_SENDER_FILTER}
+              -- NULL 会让 NOT IN 整体失效（三值逻辑），显式排除空发送者
+              SELECT DISTINCT m.sender_username FROM messages m
+              WHERE {where_sql} AND {_SELF_SENDER_FILTER} AND m.sender_username IS NOT NULL
           )
         """,
         [session_id] + list(params),
@@ -378,7 +380,11 @@ def _silent_members(
         FROM chatroom_members cm
         WHERE cm.chatroom_username = ?
           AND cm.member_username NOT IN (
-              SELECT DISTINCT m.sender_username FROM messages m WHERE {where_sql}
+              -- 与上面的 silent_total 必须同口径：漏掉 _SELF_SENDER_FILTER 会让
+              -- 「沉默人数」与「沉默名单」在群自身也算成员时对不上。
+              -- NULL 会让 NOT IN 整体失效，显式排除空发送者。
+              SELECT DISTINCT m.sender_username FROM messages m
+              WHERE {where_sql} AND {_SELF_SENDER_FILTER} AND m.sender_username IS NOT NULL
           )
         ORDER BY name
         LIMIT ?
@@ -411,7 +417,7 @@ def _sessionization(
     row = cur.execute(
         f"""
         WITH gaps AS (
-            SELECT m.create_time - LAG(m.create_time) OVER (ORDER BY m.create_time) AS gap
+            SELECT m.create_time - LAG(m.create_time) OVER (ORDER BY m.create_time, m.id) AS gap
             FROM messages m WHERE {where_sql}
         )
         SELECT COUNT(gap) AS n,
@@ -429,7 +435,7 @@ def _sessionization(
         median_row = cur.execute(
             f"""
             WITH gaps AS (
-                SELECT m.create_time - LAG(m.create_time) OVER (ORDER BY m.create_time) AS gap
+                SELECT m.create_time - LAG(m.create_time) OVER (ORDER BY m.create_time, m.id) AS gap
                 FROM messages m WHERE {where_sql}
             )
             SELECT gap FROM gaps WHERE gap IS NOT NULL ORDER BY gap LIMIT 1 OFFSET ?
@@ -614,7 +620,8 @@ def search_wechat_messages(
         params.append(target["username"])
 
     direction = "ASC" if str(order or "").strip().lower() == "asc" else "DESC"
-    sql += f" ORDER BY m.create_time {direction} LIMIT ? OFFSET ?"
+    # 与 get_messages_by_range 同理：同秒消息必须有 id 次键，否则翻页会重复/漏条。
+    sql += f" ORDER BY m.create_time {direction}, m.id {direction} LIMIT ? OFFSET ?"
     params.extend([_clamp(limit, 20, 500), _safe_offset(offset)])
 
     rows = cur.execute(sql, params).fetchall()
@@ -772,7 +779,8 @@ def get_session_history(session_id: str, limit: int = 50, days: Optional[int] = 
         sql += " AND m.create_time >= ?"
         params.append(start_ts)
         
-    sql += " ORDER BY m.create_time DESC LIMIT ?"
+    # 取最近 N 条时也要 id 次键：同秒边界若顺序不定，每次返回的最后一条会不同。
+    sql += " ORDER BY m.create_time DESC, m.id DESC LIMIT ?"
     params.append(_clamp(limit, 30, 500))
     
     rows = cur.execute(sql, params).fetchall()
@@ -1029,6 +1037,7 @@ def get_messages_by_date(date: str, session_id: Optional[str] = None, limit: int
         dt_start = datetime.datetime.strptime(date, "%Y-%m-%d")
         dt_end = dt_start + datetime.timedelta(days=1)
     except Exception as e:
+        conn.close()
         return [{"error": f"Invalid date format: {e}"}]
 
     # create_time 单位随微信版本而异（秒 / 毫秒），必须按实际单位换算查询区间
@@ -1052,7 +1061,7 @@ def get_messages_by_date(date: str, session_id: Optional[str] = None, limit: int
         sql += " AND m.session_username = ?"
         params.append(session_id)
         
-    sql += " ORDER BY m.create_time ASC LIMIT ? OFFSET ?"
+    sql += " ORDER BY m.create_time ASC, m.id ASC LIMIT ? OFFSET ?"
     params.append(_clamp(limit, 30, 500))
     params.append(_safe_offset(offset))
 
@@ -1303,7 +1312,10 @@ def get_messages_by_range(start: str, end: str, session_id: Optional[str] = None
         sql += " AND m.sender_username = ?"
         params.append(target["username"])
     direction = "DESC" if str(order or "").strip().lower() == "desc" else "ASC"
-    sql += f" ORDER BY m.create_time {direction} LIMIT ? OFFSET ?"
+    # 同秒消息的 create_time 完全相同：只按时间排序时，LIMIT/OFFSET 的分页边界不稳定，
+    # 会出现「同一条重复出现 / 某一条永远翻不到」。id 是自增唯一键，必须作次键，
+    # 且方向与主键一致，才能保证整体顺序是严格全序。
+    sql += f" ORDER BY m.create_time {direction}, m.id {direction} LIMIT ? OFFSET ?"
     params.append(_clamp(limit, 30, 500))
     params.append(_safe_offset(offset))
 
@@ -1648,7 +1660,7 @@ def _activity_stats_payload(
         LEFT JOIN contacts c ON c.username = m.sender_username
         WHERE {where_sql} AND {_SELF_SENDER_FILTER}
         GROUP BY m.sender_username
-        ORDER BY n DESC LIMIT 10
+        ORDER BY n DESC, m.sender_username LIMIT 10
     """, params).fetchall()
 
     # 发言人维度指标：全部在 SQL 侧对全量数据聚合，避免调用方分页拉取。
@@ -2032,7 +2044,7 @@ def get_member_profile(
         f"""
         WITH seq AS (
             SELECT m.create_time,
-                   m.create_time - LAG(m.create_time) OVER (ORDER BY m.create_time) AS gap
+                   m.create_time - LAG(m.create_time) OVER (ORDER BY m.create_time, m.id) AS gap
             FROM messages m WHERE {scope_where}
         )
         SELECT COUNT(*) AS n FROM seq WHERE gap IS NOT NULL AND gap <= ?
@@ -2050,7 +2062,7 @@ def get_member_profile(
             f"""
             SELECT m.create_time AS t, m.content AS content, m.local_type AS lt
             FROM messages m WHERE {scope_where}
-            ORDER BY m.create_time DESC LIMIT ?
+            ORDER BY m.create_time DESC, m.id DESC LIMIT ?
             """,
             scope_params + [sample_limit],
         ).fetchall()

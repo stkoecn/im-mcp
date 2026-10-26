@@ -195,8 +195,10 @@ def build_content(local_type: int, raw_content, raw_source) -> str:
             r"^(?:wxid_[A-Za-z0-9_-]{4,}|gh_[A-Za-z0-9_-]{4,}|[0-9]{6,}@openim):\s*", "", text
         )
 
-    # 系统消息（撤回 / 入群提示等）：正文多为可读文本，部分 type 为 sysmsg XML
-    if local_type in (10000, 10002):
+    # 系统消息（撤回 / 入群提示等）：正文多为可读文本，部分 type 为 sysmsg XML。
+    # v4 的 local_type 可能是「高位子类型 + 低位基础类型」的复合值，
+    # 与统计侧 (_BASE_TYPE_MASK) 同口径取低 32 位判断；纯值行为不变。
+    if (int(local_type or 0) & 0xFFFFFFFF) in (10000, 10002):
         raw = maybe_zstd_decompress(raw_content or raw_source)
         text = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw or "")
         text = text.strip()

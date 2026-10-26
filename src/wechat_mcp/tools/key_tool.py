@@ -31,6 +31,7 @@ import argparse
 import ctypes
 import glob
 import hashlib
+import typing
 import hmac as hmac_mod
 import json
 import logging

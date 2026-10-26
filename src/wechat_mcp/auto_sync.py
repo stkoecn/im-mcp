@@ -178,7 +178,12 @@ def refresh_and_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, A
             out["ok"] = False
             return out
     out["etl_step"] = sync_data(force=force)
-    out["ok"] = True
+    # sync_data 失败时返回 {"status": "error"} 而不是抛异常 —— 不能无条件当成功，
+    # 否则面板会显示「同步完成」，实际索引根本没更新。
+    status = str((out["etl_step"] or {}).get("status") or "").lower()
+    out["ok"] = status in ("success", "skipped")
+    if not out["ok"]:
+        out["error"] = (out["etl_step"] or {}).get("message") or "重建索引失败"
     return out
 
 
@@ -478,36 +483,35 @@ def _spawn_detached_worker(force: bool, redecrypt: bool) -> Optional[subprocess.
     }
 
     def _spawn(flags: int, extra: Optional[Dict[str, Any]] = None) -> subprocess.Popen:
-        proc = subprocess.Popen(cmd, creationflags=flags, **kwargs, **(extra or {}))
-        # 句柄必须活到子进程启动完成；挂在 proc 上避免被 GC 提前关闭
-        proc._log_fh = log_fh  # type: ignore[attr-defined]
-        return proc
+        return subprocess.Popen(cmd, creationflags=flags, **kwargs, **(extra or {}))
 
-    if os.name == "nt":
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-        base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-        try:
-            return _spawn(base | CREATE_BREAKAWAY_FROM_JOB)
-        except OSError as exc:
-            logger.warning(f"breakaway 启动失败（{exc}），退回不带 breakaway 的 detached")
-            try:
-                proc = _spawn(base)
-                proc._spawn_breakaway_error = str(exc)  # type: ignore[attr-defined]
-                return proc
-            except OSError as exc2:
-                logger.warning(f"独立同步进程启动失败：{exc2}")
-                if log_fh is not subprocess.DEVNULL:
-                    log_fh.close()
-                return None
     try:
-        return _spawn(0, {"start_new_session": True})
-    except OSError as exc:
-        logger.warning(f"独立同步进程启动失败：{exc}")
+        if os.name == "nt":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+            base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+            try:
+                return _spawn(base | CREATE_BREAKAWAY_FROM_JOB)
+            except OSError as exc:
+                logger.warning(f"breakaway 启动失败（{exc}），退回不带 breakaway 的 detached")
+                try:
+                    proc = _spawn(base)
+                    proc._spawn_breakaway_error = str(exc)  # type: ignore[attr-defined]
+                    return proc
+                except OSError as exc2:
+                    logger.warning(f"独立同步进程启动失败：{exc2}")
+                    return None
+        try:
+            return _spawn(0, {"start_new_session": True})
+        except OSError as exc:
+            logger.warning(f"独立同步进程启动失败：{exc}")
+            return None
+    finally:
+        # 子进程启动时已拿到自己的句柄副本；父进程这份必须关掉，
+        # 否则每次 start_sync 都会泄漏一个日志文件句柄。
         if log_fh is not subprocess.DEVNULL:
             log_fh.close()
-        return None
 
 
 def start_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, Any]:
