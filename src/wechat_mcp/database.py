@@ -6,6 +6,7 @@ from pathlib import Path
 import logging
 
 from .config import DB_PATH, get_decrypted_dir
+from .parser import PARSER_VERSION
 from .adapters import route_sync
 from .adapters.avatars import sync_avatars_v4
 from .adapters.media import sync_emoticons_v4, sync_favorites_v4, sync_media_v4
@@ -82,6 +83,7 @@ def init_schema():
             local_type INTEGER,
             content TEXT,
             emoticon_md5 TEXT,
+            media_md5 TEXT,
             UNIQUE(source_file, session_username, local_id)
         );
 
@@ -171,12 +173,17 @@ def init_schema():
         conn.execute("ALTER TABLE messages ADD COLUMN emoticon_md5 TEXT")
     except sqlite3.OperationalError:
         pass  # 列已存在
+    # 旧库迁移：messages.media_md5（[文件] 消息的 md5，用于关联 media_files 拿真实路径）
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN media_md5 TEXT")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
     conn.commit()
     conn.close()
 
 # ETL 解析/中间库结构版本号。解析逻辑或表结构变化时必须递增，
 # 否则老用户升级后源库文件未变 -> 指纹一致 -> 直接 skipped，新逻辑永不生效。
-ETL_SCHEMA_VERSION = "7"
+ETL_SCHEMA_VERSION = "8"
 
 # 派生表（media_files / favorites / emoticons / avatars）结构版本。这些表每次
 # ETL 都会从源库整体重建，因此结构升级时直接 DROP 重建最安全，不会丢用户数据。
@@ -246,7 +253,8 @@ def sync_data(force: bool = False) -> dict:
     _migrate_derived_tables(conn)
     cur = conn.cursor()
 
-    fp = compute_fingerprint(decrypted_dir)
+    # 指纹带上解析版本：解析规则升级后即使解密产物没变，也要重扫一次补齐新字段
+    fp = f"parser:{PARSER_VERSION}:{compute_fingerprint(decrypted_dir)}"
     cur.execute("SELECT value FROM meta WHERE key='fingerprint'")
     row = cur.fetchone()
     if not force and row and row[0] == fp:
@@ -255,7 +263,7 @@ def sync_data(force: bool = False) -> dict:
         return {"status": "skipped", "message": "No new database changes", **stats}
 
     # 按版本路由执行解密数据库同步 (v3 / v4 / 扩展版本)
-    adapter_used = route_sync(decrypted_dir, cur)
+    adapter_used = route_sync(decrypted_dir, cur, force=force)
 
     # 媒体文件索引与收藏条目（绿泡泡 4.x 的独立数据库）。
     # 任一附加库解析失败都不应中断主流程，但要如实记录到返回值里。

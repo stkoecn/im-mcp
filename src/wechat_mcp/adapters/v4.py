@@ -19,7 +19,12 @@ import logging
 from pathlib import Path
 from typing import Dict
 
-from ..parser import build_content, extract_emoticon_md5
+from ..parser import (
+    PARSER_VERSION,
+    build_content,
+    extract_emoticon_md5,
+    parse_file_media,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +42,58 @@ def is_v4_layout(decrypted_dir: Path) -> bool:
     return any(p.exists() for p in patterns)
 
 
-def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
+def _ensure_etl_sources(cur: sqlite3.Cursor) -> None:
+    """ETL 进度表：按 (库文件, 表) 记录源文件指纹与已处理的最大 local_id。
+
+    消息库只追加不修改，因此源文件指纹不变 → 整表跳过；指纹变了 → 只处理
+    local_id 比上次更大的新消息。避免每次刷新都全量解析几百张 Msg_ 表。
+    """
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS etl_sources (
+            source_file  TEXT NOT NULL,
+            table_name   TEXT NOT NULL,
+            size         INTEGER,
+            mtime_ns     INTEGER,
+            max_local_id INTEGER,
+            parser_version TEXT,
+            PRIMARY KEY (source_file, table_name)
+        )
+        """
+    )
+    # 旧版本建的进度表没有 parser_version 列，补上（值留空 → 指纹必然不等于当前版本）
+    try:
+        cur.execute("ALTER TABLE etl_sources ADD COLUMN parser_version TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+
+def _etl_source_state(cur: sqlite3.Cursor, source_file: str, table_name: str):
+    row = cur.execute(
+        "SELECT size, mtime_ns, max_local_id, parser_version FROM etl_sources "
+        "WHERE source_file = ? AND table_name = ?",
+        (source_file, table_name),
+    ).fetchone()
+    return row
+
+
+def _save_etl_source(cur: sqlite3.Cursor, source_file: str, table_name: str,
+                     size: int, mtime_ns: int, max_local_id: int) -> None:
+    cur.execute(
+        """
+        INSERT INTO etl_sources (source_file, table_name, size, mtime_ns, max_local_id, parser_version)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_file, table_name) DO UPDATE SET
+            size = excluded.size,
+            mtime_ns = excluded.mtime_ns,
+            max_local_id = MAX(COALESCE(etl_sources.max_local_id, 0), excluded.max_local_id),
+            parser_version = excluded.parser_version
+        """,
+        (source_file, table_name, size, mtime_ns, max_local_id, PARSER_VERSION),
+    )
+
+
+def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor, force: bool = False) -> None:
     """执行绿泡泡 4.x 数据库同步"""
     # 1. 联系人与群成员解析
     contact_dir = decrypted_dir / "contact"
@@ -173,9 +229,27 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                     m_conn.close()
                     continue
 
+                _ensure_etl_sources(cur)
+                try:
+                    stat = db_file.stat()
+                    file_size, file_mtime = stat.st_size, stat.st_mtime_ns
+                except OSError:
+                    file_size, file_mtime = 0, 0
+
                 for tbl in tables:
                     tbl_hash = tbl[4:].strip().lower()  # 去掉 'Msg_' 前缀
                     session_name = hash_to_user.get(tbl_hash, "")
+
+                    # 剪枝：该表所在库没有变化 → 整表跳过；库变了 → 只取新消息
+                    since = None
+                    state = _etl_source_state(cur, db_file.name, tbl)
+                    fresh = bool(state) and not force
+                    current = fresh and state[3] == PARSER_VERSION
+                    if fresh and current and state[0] == file_size and state[1] == file_mtime:
+                        continue
+                    if current and state[2]:
+                        since = int(state[2])
+                    max_seen = since or 0
 
                     # 探测表字段
                     tbl_cols = [r[1] for r in m_conn.execute(f"PRAGMA table_info('{tbl}')").fetchall()]
@@ -188,7 +262,10 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                                create_time, message_content, {source_col} AS source
                         FROM '{tbl}'
                     """
+                    if since:
+                        query_sql += f" WHERE local_id > {int(since)}"
                     for r in m_conn.execute(query_sql):
+                        max_seen = max(max_seen, int(r["local_id"] or 0))
                         real_sid = r["real_sender_id"]
                         sender_name = name2id.get(real_sid, session_name) if real_sid is not None else session_name
                         if not sender_name:
@@ -203,21 +280,35 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor) -> None:
                             if r["local_type"] == 47 else None
                         )
 
+                        # [文件] 消息：把 XML 里的 md5 存下来，查询时才能关联到
+                        # media_files 的磁盘路径（否则只有文件名，没法打开原件）。
+                        # content 已经是渲染后的 "[文件] xxx"，只对它做一次解压解析，
+                        # 避免对十万级消息逐条解压。
+                        media_md5 = None
+                        if content.startswith("[文件]"):
+                            meta = parse_file_media(r["message_content"] or r["source"])
+                            media_md5 = (meta or {}).get("md5") or None
+
                         # 用 UPSERT 而非 INSERT OR REPLACE：REPLACE 是「先删后插」，
                         # 而 recursive_triggers 默认关闭，AFTER DELETE 触发器不会触发，
                         # messages_fts 会残留旧词条；且新行会拿到新的自增 id，导致主键
                         # 每次 ETL 都漂移、索引无界膨胀。UPSERT 原地更新，rowid 稳定。
                         cur.execute("""
                             INSERT INTO messages
-                            (source_file, local_id, session_username, sender_username, create_time, local_type, content, emoticon_md5)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            (source_file, local_id, session_username, sender_username, create_time, local_type, content, emoticon_md5, media_md5)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                             ON CONFLICT(source_file, session_username, local_id) DO UPDATE SET
                                 sender_username = excluded.sender_username,
                                 create_time     = excluded.create_time,
                                 local_type      = excluded.local_type,
                                 content         = excluded.content,
-                                emoticon_md5    = excluded.emoticon_md5
-                        """, (db_file.name, r["local_id"], target_session, sender_name, r["create_time"], r["local_type"], content, emoticon_md5))
+                                emoticon_md5    = excluded.emoticon_md5,
+                                media_md5       = excluded.media_md5
+                        """, (db_file.name, r["local_id"], target_session, sender_name, r["create_time"], r["local_type"], content, emoticon_md5, media_md5))
+
+                    # 记下进度：下次同一库只处理 local_id 更大的新消息
+                    if max_seen:
+                        _save_etl_source(cur, db_file.name, tbl, file_size, file_mtime, max_seen)
 
                 m_conn.close()
             except Exception as e:

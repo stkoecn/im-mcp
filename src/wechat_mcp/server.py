@@ -1,6 +1,7 @@
 import datetime
 import functools
 import logging
+import os
 import re
 import sqlite3
 from collections import Counter
@@ -87,6 +88,23 @@ def _ts_to_str(ts: int) -> str:
         return datetime.datetime.fromtimestamp(_normalize_ts(ts)).strftime("%Y-%m-%d %H:%M:%S")
     except (OverflowError, OSError, ValueError):
         return ""
+
+
+def _media_payload(media: Dict[str, Dict[str, Any]], md5: Optional[str]) -> Optional[Dict[str, Any]]:
+    """[文件] 消息的磁盘信息：路径 / 大小 / 是否还在。
+
+    md5 不在 media_files 里（未下载、已被清理）时仍返回结构，只是 path 为空。
+    """
+    if not md5:
+        return None
+    info = media.get(md5) or {}
+    path = info.get("path") or ""
+    return {
+        "md5": md5,
+        "path": path or None,
+        "size": int(info.get("size") or 0),
+        "exists": bool(path and os.path.exists(path)),
+    }
 
 
 def _parse_time_bound(value: str) -> datetime.datetime:
@@ -639,13 +657,15 @@ def search_wechat_messages(
 
 @mcp.tool()
 @_db_tool
-def list_wechat_sessions(keyword: Optional[str] = None, session_type: Optional[str] = None, limit: int = 30) -> List[Dict[str, Any]]:
+def list_wechat_sessions(keyword: Optional[str] = None, session_type: Optional[str] = None,
+                         limit: int = 30, offset: int = 0) -> List[Dict[str, Any]]:
     """查询绿泡泡会话列表（用于查找特定联系人或群聊的唯一 ID）。
 
     Args:
         keyword: 会话名称搜索关键字（群名/人名/备注）
         session_type: 会话类型筛选，可选：'room'（群聊）、'c2c'（单聊）、'gh'（公众号）
-        limit: 返回记录数，默认 30
+        limit: 返回记录数，默认 30，上限 500
+        offset: 分页偏移，配合 limit 翻页；超过 500 条时用它分页，避免逐字母前缀扫描
 
     ``unread`` 是 ETL 时从源库 Session 表读取的未读数快照（旧库可能为 0，
     需重建索引后才有值）。
@@ -673,8 +693,9 @@ def list_wechat_sessions(keyword: Optional[str] = None, session_type: Optional[s
         sql += " AND type = ?"
         params.append(session_type)
         
-    sql += " ORDER BY last_time DESC LIMIT ?"
+    sql += " ORDER BY last_time DESC LIMIT ? OFFSET ?"
     params.append(_clamp(limit, 30, 500))
+    params.append(max(0, int(offset or 0)))
     
     rows = cur.execute(sql, params).fetchall()
     results = []
@@ -810,7 +831,7 @@ def search_shared_files(keyword: Optional[str] = None, session_id: Optional[str]
     sql = """
         SELECT m.session_username, s.display_name AS session_name,
                m.sender_username, c.display_name AS sender_name,
-               m.create_time, m.content
+               m.create_time, m.content, m.media_md5
         FROM messages m
         LEFT JOIN sessions s ON s.username = m.session_username
         LEFT JOIN contacts c ON c.username = m.sender_username
@@ -829,6 +850,18 @@ def search_shared_files(keyword: Optional[str] = None, session_id: Optional[str]
     params.append(_clamp(limit, 30, 500))
     
     rows = cur.execute(sql, params).fetchall()
+
+    # 关联 media_files 拿到磁盘路径，调用方可以直接打开原件
+    media: Dict[str, Dict[str, Any]] = {}
+    md5s = sorted({r["media_md5"] for r in rows if r["media_md5"]})
+    if md5s:
+        placeholders = ",".join("?" * len(md5s))
+        for m in cur.execute(
+            f"SELECT md5, abs_path, file_size FROM media_files WHERE md5 IN ({placeholders})",
+            md5s,
+        ):
+            media.setdefault(m["md5"], {"path": m["abs_path"], "size": m["file_size"]})
+
     results = []
     for r in rows:
         results.append({
@@ -838,6 +871,7 @@ def search_shared_files(keyword: Optional[str] = None, session_id: Optional[str]
             "sender_username": r["sender_username"],
             "time": _ts_to_str(r["create_time"]),
             "file_name": r["content"].replace("[文件] ", ""),
+            "media": _media_payload(media, r["media_md5"]),
         })
     conn.close()
     return results
@@ -1383,7 +1417,7 @@ def get_messages_since(
     sql = f"""
         SELECT m.id, m.session_username, s.display_name AS session_name,
                m.sender_username, c.display_name AS sender_name,
-               m.create_time, m.content, m.emoticon_md5
+               m.create_time, m.content, m.emoticon_md5, m.media_md5
         FROM messages m
         LEFT JOIN sessions s ON s.username = m.session_username
         LEFT JOIN contacts c ON c.username = m.sender_username
@@ -1391,6 +1425,18 @@ def get_messages_since(
         ORDER BY m.id ASC LIMIT ?
     """
     rows = cur.execute(sql, params + [size + 1]).fetchall()
+
+    # [文件] 消息：用 media_md5 关联 media_files，带上磁盘路径/大小，
+    # 调用方就能「打开原件」而不是只看到一个文件名
+    media: Dict[str, Dict[str, Any]] = {}
+    md5s = sorted({r["media_md5"] for r in rows if r["media_md5"]})
+    if md5s:
+        placeholders = ",".join("?" * len(md5s))
+        for m in cur.execute(
+            f"SELECT md5, abs_path, file_size FROM media_files WHERE md5 IN ({placeholders})",
+            md5s,
+        ):
+            media.setdefault(m["md5"], {"path": m["abs_path"], "size": m["file_size"]})
     conn.close()
 
     has_more = len(rows) > size
@@ -1405,6 +1451,7 @@ def get_messages_since(
             "time": _ts_to_str(r["create_time"]),
             "content": r["content"],
             "emoticon_md5": r["emoticon_md5"],
+            "media": _media_payload(media, r["media_md5"]),
         }
         for r in rows
     ]
