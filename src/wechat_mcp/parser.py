@@ -1,5 +1,6 @@
 import re
 import logging
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +180,32 @@ def extract_emoticon_md5(raw_content, raw_source=None) -> str | None:
         raw = raw.encode("utf-8", errors="ignore")
     match = _EMOJI_MD5_RE.search(raw)
     return match.group(1).decode("ascii").lower() if match else None
+
+
+def parse_file_media(raw) -> Optional[Dict[str, Any]]:
+    """解析 [文件] 消息的元信息：{md5, name, size}。
+
+    appmsg 里 ``<md5>`` 就是文件内容的 md5，与 media_files.md5 一一对应，
+    用它才能把「[文件] 报告.pdf」这条消息关联到磁盘上的真实文件。
+    非文件消息返回 None。
+    """
+    text = maybe_zstd_decompress(raw)
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="ignore")
+    text = str(text or "")
+    if "<appmsg" not in text:
+        return None
+
+    md5 = (extract_tag_from_xml(text, "md5") or "").strip().lower()
+    name = " ".join((extract_tag_from_xml(text, "title") or "").split())
+    size_text = (extract_tag_from_xml(text, "totallen") or "").strip()
+    try:
+        size = int(size_text)
+    except (TypeError, ValueError):
+        size = 0
+    if not md5 and not name:
+        return None
+    return {"md5": md5, "name": name, "size": size}
 
 
 def build_content(local_type: int, raw_content, raw_source) -> str:

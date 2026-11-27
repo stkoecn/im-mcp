@@ -3,6 +3,44 @@
 本文件逐条记录本仓库相对上游 `stkoecn/im-mcp` 初始版本（v0.0.1）的全部改动，
 便于上游维护者对照 review（对应 PR #10）。所有改动均已实测复现后再修改。
 
+## 刷新改为增量、[文件] 消息可定位到磁盘原件
+
+### 问题
+
+1. **每次刷新都是全量**：重新解密全部数据库、重新解析全部 `Msg_*` 表（11 万条
+   消息约 8.9s）；会话列表超过 500 条时调用方只能按「字母+数字」前缀扫描补全
+   （1181 个群要发 261 次请求，约 3.6s）。端到端刷新约 8.3s，而真正变化的往往
+   只有几条新消息。
+2. **文件只有名字**：`[文件] 报告.pdf` 只是正文文本，`messages` 里没有和
+   `media_files` 的关联，调用方拿不到磁盘路径，只能显示「仅消息记录」。
+
+### 修复
+
+- **解密剪枝**：新增 `.decrypt_manifest.json`，按源库（本体 + WAL）的
+  `(size, mtime_ns)` 记录解密结果；指纹未变且输出还在 → 跳过。`--force` 保留全量。
+- **ETL 剪枝**：新增 `etl_sources(source_file, table_name, size, mtime_ns,
+  max_local_id)`。库指纹未变 → 整表跳过；变了 → 只处理 `local_id` 更大的新消息。
+  进度取 `MAX`，不会因换库 / 回滚倒退。
+- **会话列表分页**：`list_wechat_sessions` 新增 `offset`，配合 `limit`（上限 500）
+  翻页，排序补 `username` 保证跨页稳定。
+- **文件路径**：`messages` 新增 `media_md5`（ETL 从 appmsg 的 `<md5>` 提取），
+  `get_messages_since` / `search_shared_files` 用它在 `media_files` 里查
+  `abs_path` / `file_size` / `exists`，返回 `media: {md5, path, size, exists}`。
+- `ETL_SCHEMA_VERSION` 升到 8，老库会自动重建补齐 `media_md5`；
+  `refresh_and_sync(force=True)` 把 force 一并传给解密步骤。
+
+### 实测（11.6 万条消息的真实库）
+
+| 场景 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 全量重建（force） | 8.87s | 8.87s |
+| 无变化刷新 | 8.87s | **0.02s** |
+| 单个库有新消息 | ~8.9s | **1.21s** |
+| 群列表（1181 个） | 261 次调用 / 3.62s | **2 次调用 / 0.07s** |
+| 端到端刷新（平台客户端） | 8.30s | **4.02s** |
+
+`python -m unittest discover -s tests`：73 tests OK（新增 etl_sources 进度用例）。
+
 ## 图片 V2 密钥提取、表情明文库与 `emoticon_md5` 贯通（绿泡泡工具 26 → 29 个）
 
 ### 新增 MCP 工具（3 个）

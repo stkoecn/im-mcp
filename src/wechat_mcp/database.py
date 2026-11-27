@@ -82,6 +82,7 @@ def init_schema():
             local_type INTEGER,
             content TEXT,
             emoticon_md5 TEXT,
+            media_md5 TEXT,
             UNIQUE(source_file, session_username, local_id)
         );
 
@@ -171,12 +172,17 @@ def init_schema():
         conn.execute("ALTER TABLE messages ADD COLUMN emoticon_md5 TEXT")
     except sqlite3.OperationalError:
         pass  # 列已存在
+    # 旧库迁移：messages.media_md5（[文件] 消息的 md5，用于关联 media_files 拿真实路径）
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN media_md5 TEXT")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
     conn.commit()
     conn.close()
 
 # ETL 解析/中间库结构版本号。解析逻辑或表结构变化时必须递增，
 # 否则老用户升级后源库文件未变 -> 指纹一致 -> 直接 skipped，新逻辑永不生效。
-ETL_SCHEMA_VERSION = "7"
+ETL_SCHEMA_VERSION = "8"
 
 # 派生表（media_files / favorites / emoticons / avatars）结构版本。这些表每次
 # ETL 都会从源库整体重建，因此结构升级时直接 DROP 重建最安全，不会丢用户数据。
@@ -255,7 +261,7 @@ def sync_data(force: bool = False) -> dict:
         return {"status": "skipped", "message": "No new database changes", **stats}
 
     # 按版本路由执行解密数据库同步 (v3 / v4 / 扩展版本)
-    adapter_used = route_sync(decrypted_dir, cur)
+    adapter_used = route_sync(decrypted_dir, cur, force=force)
 
     # 媒体文件索引与收藏条目（绿泡泡 4.x 的独立数据库）。
     # 任一附加库解析失败都不应中断主流程，但要如实记录到返回值里。

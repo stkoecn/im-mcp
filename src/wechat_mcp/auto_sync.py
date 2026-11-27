@@ -91,7 +91,8 @@ def _db_dir_from_keys(keys_path: Path) -> Optional[str]:
 
 
 def refresh_decrypted(db_dir: Optional[str] = None,
-                      keys_file: Optional[Path] = None) -> Dict[str, Any]:
+                      keys_file: Optional[Path] = None,
+                      force: bool = False) -> Dict[str, Any]:
     """重新解密源库到解密目录（含 WAL 合并）。
 
     返回 ``{"ok": bool, ...}``；失败时 ``error`` 说明原因。本函数不抛异常，
@@ -131,6 +132,8 @@ def refresh_decrypted(db_dir: Optional[str] = None,
         "--keys", str(keys_path),
         "--output", str(out_dir),
     ]
+    if force:
+        cmd.append("--force")
     env = dict(os.environ)
     # 子进程输出按 UTF-8 解码，避免 Windows 默认代码页把中文进度串弄成乱码
     env["PYTHONIOENCODING"] = "utf-8"
@@ -170,7 +173,7 @@ def refresh_and_sync(force: bool = False, redecrypt: bool = True) -> Dict[str, A
     """执行一次完整同步，返回两步各自的结果。"""
     out: Dict[str, Any] = {}
     if redecrypt:
-        refresh = refresh_decrypted()
+        refresh = refresh_decrypted(force=force)
         out["decrypt_step"] = refresh
         if not refresh.get("ok"):
             # 解密失败就不重建索引：在旧快照上重建只会让结果看起来「成功」但内容没变

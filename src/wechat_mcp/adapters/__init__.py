@@ -19,7 +19,8 @@ def detect_version(decrypted_dir: Path) -> str:
     return "unknown"
 
 
-def route_sync(decrypted_dir: Path, cur: sqlite3.Cursor, version_hint: str = "auto") -> str:
+def route_sync(decrypted_dir: Path, cur: sqlite3.Cursor, version_hint: str = "auto",
+               force: bool = False) -> str:
     """按版本路由执行同步逻辑"""
     version = version_hint
     if version == "auto":
@@ -28,7 +29,7 @@ def route_sync(decrypted_dir: Path, cur: sqlite3.Cursor, version_hint: str = "au
     logger.info(f"Routing database sync using adapter: {version}")
 
     if version == "v4":
-        sync_v4(decrypted_dir, cur)
+        sync_v4(decrypted_dir, cur, force=force)
         return "v4"
     elif version == "v3":
         sync_v3(decrypted_dir, cur)
@@ -36,6 +37,6 @@ def route_sync(decrypted_dir: Path, cur: sqlite3.Cursor, version_hint: str = "au
     else:
         # 宽容处理：依次尝试 v4 和 v3
         logger.warning(f"Unable to accurately determine layout for {decrypted_dir}, attempting v4 then v3")
-        sync_v4(decrypted_dir, cur)
+        sync_v4(decrypted_dir, cur, force=force)
         sync_v3(decrypted_dir, cur)
         return "fallback"

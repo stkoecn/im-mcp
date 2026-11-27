@@ -1804,7 +1804,41 @@ def _db_quick_check(path: str) -> bool:
         return False
 
 
-def decrypt_all(db_dir: str, out_dir: str, keys_file: str) -> dict:
+def _source_stamp(path: str) -> dict:
+    """源库指纹：本体 + WAL 的 (size, mtime_ns)，用于跳过没变化的库。"""
+    stamp = {"size": 0, "mtime_ns": 0, "wal_size": 0, "wal_mtime_ns": 0}
+    for suffix, prefix in (("", ""), ("-wal", "wal_")):
+        try:
+            st = os.stat(path + suffix)
+        except OSError:
+            continue
+        stamp[prefix + "size"] = st.st_size
+        stamp[prefix + "mtime_ns"] = st.st_mtime_ns
+    return stamp
+
+
+def _load_decrypt_manifest(out_dir: str) -> dict:
+    path = os.path.join(out_dir, ".decrypt_manifest.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_decrypt_manifest(out_dir: str, manifest: dict) -> None:
+    path = os.path.join(out_dir, ".decrypt_manifest.json")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.debug(f"写入解密清单失败（不影响本次结果）: {exc}")
+
+
+def decrypt_all(db_dir: str, out_dir: str, keys_file: str, force: bool = False) -> dict:
     _print("=" * 60)
     _print(f"  WeChat 数据库解密器 ({sys.platform})")
     _print("=" * 60)
@@ -1829,8 +1863,9 @@ def decrypt_all(db_dir: str, out_dir: str, keys_file: str) -> dict:
     db_files.sort(key=lambda x: x[2])
     _print(f"找到 {len(db_files)} 个数据库文件\n")
 
-    success = failed = 0
+    success = failed = skipped = 0
     total_bytes = 0
+    manifest = {} if force else _load_decrypt_manifest(out_dir)
     for rel, path, sz in db_files:
         key_info = _get_key_info(keys, rel)
         if not key_info:
@@ -1839,6 +1874,14 @@ def decrypt_all(db_dir: str, out_dir: str, keys_file: str) -> dict:
             continue
         enc_key = bytes.fromhex(key_info["enc_key"])
         out_path = os.path.join(out_dir, rel)
+
+        # 剪枝：源库（含 WAL）没变化且上次解密结果还在，就直接跳过，
+        # 避免每次刷新都重新解密几百 MB。--force / force=True 时全量。
+        stamp = _source_stamp(path)
+        if not force and manifest.get(rel) == stamp and os.path.exists(out_path):
+            skipped += 1
+            continue
+
         _print(f"解密: {rel} ({sz / 1024 / 1024:.1f}MB) ...", end=" ")
         if _decrypt_database(path, out_path, enc_key):
             wal_frames = _merge_encrypted_wal(out_path, path + "-wal", enc_key)
@@ -1856,16 +1899,19 @@ def decrypt_all(db_dir: str, out_dir: str, keys_file: str) -> dict:
                 _print(f"  OK! 表: {', '.join(t[0] for t in tables[:5])}")
                 success += 1
                 total_bytes += sz
+                manifest[rel] = stamp
             except Exception as e:
                 _print(f"  [WARN] SQLite 验证失败: {e}")
                 failed += 1
         else:
             failed += 1
 
+    _save_decrypt_manifest(out_dir, manifest)
     _print(f"\n{'=' * 60}")
-    _print(f"结果: {success} 成功, {failed} 失败, 共 {len(db_files)} 个")
+    _print(f"结果: {success} 成功, {skipped} 跳过（未变化）, {failed} 失败, 共 {len(db_files)} 个")
     _print(f"解密数据量: {total_bytes / 1024 / 1024 / 1024:.1f}GB")
-    return {"success": success, "failed": failed, "total": len(db_files), "total_bytes": total_bytes}
+    return {"success": success, "failed": failed, "skipped": skipped,
+            "total": len(db_files), "total_bytes": total_bytes}
 
 
 # ============================================================
@@ -2034,7 +2080,7 @@ def cmd_decrypt(args: argparse.Namespace) -> None:
     if not db_dir:
         _print("[ERROR] 未能确定数据库目录，请使用 --db-dir 手动指定")
         sys.exit(1)
-    decrypt_all(db_dir, args.output, args.keys)
+    decrypt_all(db_dir, args.output, args.keys, force=getattr(args, "force", False))
 
 
 def main() -> None:
@@ -2073,6 +2119,8 @@ def main() -> None:
     decrypt_cmd.add_argument("--db-dir")
     decrypt_cmd.add_argument("--keys", default="all_keys.json")
     decrypt_cmd.add_argument("--output", default="decrypted")
+    decrypt_cmd.add_argument("--force", action="store_true",
+                             help="忽略解密清单，强制重新解密全部数据库")
 
     args = parser.parse_args()
     if args.verbose:
