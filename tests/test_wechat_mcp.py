@@ -62,6 +62,48 @@ class TestWeChatParser(unittest.TestCase):
         res = build_content(10000, None, xml)
         self.assertEqual(res, "对方撤回了一条消息")
 
+    def test_system_sysmsgtemplate_renders_names(self):
+        # 入群提示：可读文案在 <template>，人名在 <link_list> 里按占位符替换；
+        # 旧实现只找 <content>/<plain>，会把整段 XML 当成正文
+        xml = (
+            'wxid_group@chatroom:\n<sysmsg type="sysmsgtemplate"><sysmsgtemplate>'
+            '<content_template type="tmpl_type_profile"><plain><![CDATA[]]></plain>'
+            '<template><![CDATA["$username$"邀请"$names$"加入了群聊]]></template>'
+            '<link_list>'
+            '<link name="username" type="link_profile"><memberlist><member>'
+            "<username>wxid_a</username><nickname>ori</nickname></member></memberlist></link>"
+            '<link name="names" type="link_profile"><memberlist><member>'
+            "<username>wxid_b</username><nickname>李泽新</nickname></member></memberlist>"
+            "<separator>、</separator></link>"
+            "</link_list></content_template></sysmsgtemplate></sysmsg>"
+        )
+        res = build_content(10000, None, xml)
+        self.assertEqual(res, '"ori"邀请"李泽新"加入了群聊')
+        self.assertNotIn("<", res)
+        self.assertNotIn("@chatroom", res)
+
+    def test_system_html_markup_stripped(self):
+        # 红包 / 群公告里夹 <img>/<a> 等排版标签，不能原样输出
+        xml = '<img src="SystemMessages_HongbaoIcon.png"/>肖丕军领取了你的红包'
+        self.assertEqual(build_content(10000, xml, None), "肖丕军领取了你的红包")
+
+    def test_chat_record_inlined(self):
+        # 合并转发的聊天记录：直接把子消息渲染进正文，而不是只留 [聊天记录] 标题
+        local_type = (19 << 32) | 49
+        xml = (
+            "<msg><appmsg><title>群聊的聊天记录</title><type>19</type><recorditem><![CDATA["
+            '<recordinfo><title>群聊的聊天记录</title><datalist count="2">'
+            '<dataitem datatype="1" dataid="x1"><datadesc>hi</datadesc>'
+            "<sourcename>A</sourcename></dataitem>"
+            '<dataitem datatype="8" dataid="x2"><datadesc></datadesc>'
+            "<datatitle>报告.pdf</datatitle><sourcename>B</sourcename></dataitem>"
+            "</datalist></recordinfo>]]></recorditem></appmsg></msg>"
+        )
+        res = build_content(local_type, None, xml)
+        self.assertIn("[聊天记录] 群聊的聊天记录（共 2 条）", res)
+        self.assertIn("A: hi", res)
+        self.assertIn("B: [文件] 报告.pdf", res)
+
 
 class TestUtilities(unittest.TestCase):
     def test_ts_to_str(self):

@@ -6,7 +6,7 @@
 
 import unittest
 
-from wechat_mcp.records import find_raw_content, parse_chat_record
+from wechat_mcp.records import find_raw_content, parse_chat_record, render_record_text
 
 SAMPLE = (
     "<msg><appmsg><title>群聊的聊天记录</title><des>A:&#x20;hi</des><type>19</type>"
@@ -79,6 +79,52 @@ class TestParseChatRecord(unittest.TestCase):
     def test_empty_input(self):
         self.assertIn("error", parse_chat_record(""))
         self.assertIn("error", parse_chat_record(None))
+
+
+class TestRenderRecordText(unittest.TestCase):
+    def test_renders_transcript(self):
+        text = render_record_text(SAMPLE)
+        self.assertTrue(text.startswith("[聊天记录] 群聊的聊天记录（共 2 条）"))
+        self.assertIn("A: hi there", text)
+        self.assertIn("B: [图片]", text)
+
+    def test_file_item_uses_datatitle(self):
+        xml = (
+            "<msg><recorditem><![CDATA[<recordinfo><title>t</title>"
+            '<datalist count="1"><dataitem datatype="8" dataid="f1">'
+            "<datadesc></datadesc><datatitle>中期材料.zip</datatitle>"
+            "<sourcename>D</sourcename></dataitem></datalist>"
+            "</recordinfo>]]></recorditem></msg>"
+        )
+        self.assertIn("D: [文件] 中期材料.zip", render_record_text(xml))
+
+    def test_escaped_recorditem_is_unescaped(self):
+        # 部分客户端的 recorditem 是转义一层的（&lt;recordinfo&gt;…），
+        # 直接按标签匹配会一个条目都取不到
+        escaped = (
+            "<msg><appmsg><type>19</type><recorditem>"
+            "&lt;recordinfo&gt;&lt;title&gt;T&lt;/title&gt;"
+            '&lt;datalist count="1"&gt;&lt;dataitem datatype="1" dataid="e1"&gt;'
+            "&lt;datadesc&gt;hello&lt;/datadesc&gt;"
+            "&lt;sourcename&gt;E&lt;/sourcename&gt;&lt;/dataitem&gt;"
+            "&lt;/datalist&gt;&lt;/recordinfo&gt;"
+            "</recorditem></appmsg></msg>"
+        )
+        self.assertEqual(parse_chat_record(escaped)["items"][0]["desc"], "hello")
+        self.assertIn("E: hello", render_record_text(escaped))
+
+    def test_limits_items(self):
+        items = "".join(
+            f'<dataitem datatype="1" dataid="i{n}"><datadesc>m{n}</datadesc></dataitem>'
+            for n in range(120)
+        )
+        xml = f"<msg><recorditem><![CDATA[<recordinfo><title>t</title><datalist count='120'>{items}</datalist></recordinfo>]]></recorditem></msg>"
+        text = render_record_text(xml, max_items=60)
+        self.assertEqual(text.count("\n"), 61)  # 标题 + 60 条 + 省略提示
+        self.assertIn("已省略 60 条", text)
+
+    def test_not_a_record(self):
+        self.assertEqual(render_record_text("<msg><appmsg><title>x</title></appmsg></msg>"), "")
 
 
 class TestFindRawContent(unittest.TestCase):
