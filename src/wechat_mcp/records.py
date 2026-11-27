@@ -44,6 +44,27 @@ _ITEM_KINDS: Dict[int, str] = {
 }
 
 _RECORDITEM_RE = re.compile(r"<recorditem\b[^>]*>(.*?)</recorditem>", re.DOTALL)
+
+# 渲染正文时的中文类型标签（缺失 datadesc 时用，如 [文件] 报告.pdf）
+_ITEM_KINDS_ZH = {
+    1: "文本",
+    2: "图片",
+    3: "语音",
+    4: "视频",
+    5: "链接",
+    6: "位置",
+    7: "名片",
+    8: "文件",
+    17: "聊天记录",
+    19: "聊天记录",
+    21: "小程序",
+    22: "视频号",
+    23: "音乐",
+    24: "表情",
+    26: "笔记",
+    27: "通话",
+}
+
 _CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.DOTALL)
 _ITEM_RE = re.compile(r"<dataitem\b([^>]*)>(.*?)</dataitem>", re.DOTALL)
 _ATTR_RE = re.compile(r'([A-Za-z_][\w-]*)\s*=\s*"([^"]*)"')
@@ -72,6 +93,10 @@ def parse_chat_record(raw: str) -> Dict[str, Any]:
     body = m.group(1)
     cdata = _CDATA_RE.search(body)
     xml = cdata.group(1) if cdata else body
+    # 部分客户端的 recorditem 是「转义一层」的（&lt;recordinfo&gt;…），
+    # 直接按标签匹配会一个条目都取不到，这里还原一次再解析。
+    if "<dataitem" not in xml and "&lt;" in xml:
+        xml = html.unescape(xml)
 
     items: List[Dict[str, Any]] = []
     for attrs, inner in _ITEM_RE.findall(xml):
@@ -85,6 +110,7 @@ def parse_chat_record(raw: str) -> Dict[str, Any]:
                 "type": _ITEM_KINDS.get(datatype, f"type_{datatype}"),
                 "datatype": datatype,
                 "desc": _tag_text(inner, "datadesc"),
+                "title": _tag_text(inner, "datatitle"),
                 "sender": _tag_text(inner, "sourcename"),
                 "time": _tag_text(inner, "sourcetime"),
                 "format": _opt(_tag_text(inner, "datafmt")),
@@ -104,6 +130,47 @@ def parse_chat_record(raw: str) -> Dict[str, Any]:
         "declared_count": int(declared.group(1)) if declared else None,
         "items": items,
     }
+
+
+def render_record_text(raw: str, max_items: int = 60, max_chars: int = 2000) -> str:
+    """把「聊天记录」合并消息渲染成多行纯文本，供 ETL 直接写入索引正文。
+
+    返回空串表示正文里没有 recorditem（不是聊天记录），调用方自行兜底。
+    子条目数量与总字数都做上限，避免几十页的转发记录把正文撑爆。
+    """
+    parsed = parse_chat_record(raw)
+    if parsed.get("error"):
+        return ""
+
+    items: List[Dict[str, Any]] = parsed.get("items") or []
+    if not items:
+        return ""
+
+    total = parsed.get("declared_count") or len(items)
+    title = (parsed.get("title") or "").strip() or "聊天记录"
+    lines = [f"[聊天记录] {title}（共 {total} 条）"]
+    for item in items[:max_items]:
+        desc = (item.get("desc") or "").strip()
+        if not desc:
+            kind = _ITEM_KINDS_ZH.get(item.get("datatype"), "")
+            label = (item.get("title") or "").strip()
+            if kind and label:
+                desc = f"[{kind}] {label}"
+            elif kind:
+                desc = f"[{kind}]"
+            else:
+                desc = f"[{item.get('type') or '消息'}]"
+        desc = re.sub(r"\s*\n\s*", " ⏎ ", desc)
+        sender = (item.get("sender") or "").strip()
+        lines.append(f"{sender}: {desc}" if sender else desc)
+    omitted = max(0, (total or 0) - min(len(items), max_items))
+    if omitted:
+        lines.append(f"…（已省略 {omitted} 条）")
+
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "…"
+    return text
 
 
 def find_raw_content(source_file: str, local_id: int, create_time: int) -> Optional[str]:

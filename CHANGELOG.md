@@ -3,6 +3,46 @@
 本文件逐条记录本仓库相对上游 `stkoecn/im-mcp` 初始版本（v0.0.1）的全部改动，
 便于上游维护者对照 review（对应 PR #10）。所有改动均已实测复现后再修改。
 
+## 系统消息不再泄漏原始 XML，合并转发的「聊天记录」直接内联展开
+
+### 问题
+
+1. **系统提示变成 XML 乱码**：入群 / 撤回 / 群公告等 `10000/10002` 消息在群聊里
+   显示为 `<sysmsg type="sysmsgtemplate">…<link_list><memberlist>…` 整段标签，
+   正文里还带着 `<xxx>@chatroom:` 会话前缀。原因是微信 4.x 的可读文案在
+   `<template>` 里，人名位置是 `$username$` / `$names$` 占位符，真实昵称在
+   `<link_list>` 中；旧实现只找 `<content>`/`<plain>`（`<plain>` 通常是空 CDATA），
+   于是整段 XML 被当作正文返回。
+2. **转发记录只剩标题**：合并转发的聊天记录只留下 `[聊天记录] 标题`，子消息
+   需要回解密快照逐条展开（`get_chat_record`），导入到工作区 / 索引后不可读。
+3. **条目丢失**：部分客户端的 `<recorditem>` 是转义一层的（`&lt;recordinfo&gt;…`），
+   按标签匹配会一个条目都取不到。
+
+### 修复
+
+- `parser._render_sysmsg()`：优先取 `content`/`text`/`replacemsg`；否则解析
+  `<content_template>` 的 `<template>`，把 `$username$` / `$names$` 按
+  `<link_list><link name="…"><memberlist>` 替换（`<separator>` 连接多人）；
+  最后兜底 `_strip_markup()` 剥标签，绝不再把 XML 原样当正文。
+- `10000/10002` 分支先剥掉 `<会话 id>@chatroom:` / `wxid_…:` 等前缀，正文里只要
+  还有标签就走渲染 / 剥标签，红包、群公告里的 `<img>`、`<a>`、`<_wc_custom_link_>`
+  都变成纯文字。普通文字消息（`local_type=1`）不动——那里的尖括号可能是代码、
+  数学式或 `P<0.05` 之类的正文。
+- `records.render_record_text()`：ETL 阶段直接把 `recorditem` 渲染成多行
+  「`发送者: 内容`」，首行是 `[聊天记录] 标题（共 N 条）`，缺 `datadesc` 的条目
+  按 `datatype` 输出 `[文件] 文件名` 等中文标签；默认最多 60 条 / 2000 字，
+  超出追加「已省略 N 条」，避免超长转发撑爆正文。
+- `parse_chat_record()`：`recorditem` 里出现 `&lt;` 且没有 `<dataitem` 时先
+  `html.unescape` 一次再解析。
+- 链接 / 小程序标题改为剥掉 HTML 标签后输出。
+- 新增 9 个用例（系统消息渲染 3 个、转发记录渲染 5 个、解析 1 个）。
+
+### 实测
+
+真实库（11.6 万条消息）：系统消息 XML 残留从数百条降到 0；`[聊天记录]` 单行占位
+从 21 条降到 0，402 条转发记录被内联成完整多行对话；平台导入接口返回的正文直接
+可读。`python -m unittest discover -s tests`：82 tests OK。
+
 ## 图片 V2 密钥提取、表情明文库与 `emoticon_md5` 贯通（绿泡泡工具 26 → 29 个）
 
 ### 新增 MCP 工具（3 个）

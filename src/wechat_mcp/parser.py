@@ -1,5 +1,7 @@
+import html
 import re
 import logging
+from typing import Dict
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +183,88 @@ def extract_emoticon_md5(raw_content, raw_source=None) -> str | None:
     return match.group(1).decode("ascii").lower() if match else None
 
 
+# 系统消息正文前的会话标记：群聊是 `<xxx>@chatroom:`，私聊是 `wxid_xxx:` /
+# 公众号的 `gh_xxx:` / 服务号的 `<数字>@openim:`。它们在正文里是冗余标记。
+_SYSMSG_PREFIX_RE = re.compile(
+    r"^(?:[A-Za-z0-9_.\-]{3,}@chatroom|wxid_[A-Za-z0-9_-]{4,}|gh_[A-Za-z0-9_-]{4,}"
+    r"|[0-9]{6,}@openim):\s*"
+)
+_CDATA_RE = re.compile(r"<!\[CDATA\[(.*?)\]\]>", re.DOTALL)
+_TAG_RE = re.compile(r"<[^<>]{0,4000}>")
+_LINK_RE = re.compile(r'<link\s+name="([^"]+)"[^>]*>(.*?)</link>', re.DOTALL)
+_MEMBER_RE = re.compile(r"<member>(.*?)</member>", re.DOTALL)
+_NICKNAME_RE = re.compile(r"<nickname>(.*?)</nickname>", re.DOTALL)
+_USERNAME_RE = re.compile(r"<username>(.*?)</username>", re.DOTALL)
+_SEPARATOR_RE = re.compile(r"<separator>(.*?)</separator>", re.DOTALL)
+_PLACEHOLDER_RE = re.compile(r"\$([A-Za-z_]+)\$")
+
+
+def _inner_text(fragment: str) -> str:
+    """取标签内的文本：去 CDATA、去内层标签、反转义、压缩空白。"""
+    if not fragment:
+        return ""
+    return re.sub(r"\s+", " ", html.unescape(_TAG_RE.sub("", _CDATA_RE.sub(r"\1", fragment)))).strip()
+
+
+def _strip_markup(text: str) -> str:
+    """去掉 XML 标签与 CDATA，返回可读纯文本（兜底用，避免把原始 XML 塞进正文）。"""
+    if not text:
+        return ""
+    text = _TAG_RE.sub(" ", _CDATA_RE.sub(r"\1", text))
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def _link_text_map(text: str) -> Dict[str, str]:
+    """把 <link_list> 解析成 {占位符名: 可读文案}。
+
+    例：``<link name="names"><memberlist><member><nickname>李泽新</nickname></member>``
+    ``</memberlist><separator>、</separator></link>`` → ``{"names": "李泽新"}``，
+    多个成员用 separator 连接（如「李泽新、王五」）。
+    """
+    mapping: Dict[str, str] = {}
+    for name, body in _LINK_RE.findall(text):
+        separator_match = _SEPARATOR_RE.search(body)
+        separator = _inner_text(separator_match.group(1)) if separator_match else "、"
+        members = []
+        for member in _MEMBER_RE.findall(body):
+            nickname_match = _NICKNAME_RE.search(member)
+            nick = _inner_text(nickname_match.group(1)) if nickname_match else ""
+            if not nick:
+                username_match = _USERNAME_RE.search(member)
+                nick = _inner_text(username_match.group(1)) if username_match else ""
+            if nick:
+                members.append(nick)
+        if members:
+            mapping[name] = (separator or "、").join(members)
+    return mapping
+
+
+def _render_sysmsg(text: str) -> str:
+    """把 <sysmsg> 系统消息渲染成可读提示语。
+
+    微信 4.x 的入群 / 撤回 / 群公告等提示是 ``sysmsgtemplate``：可读文案在
+    ``<template>`` 里，人名位置是 ``$username$`` / ``$names$`` 占位符，真实昵称在
+    ``<link_list><link name="…"><memberlist><nickname>`` 中。旧实现只找
+    ``<content>``/``<plain>``，而 ``<plain>`` 通常是空 CDATA，于是整段 XML 被原样
+    返回，群里就会看到 ``<sysmsg …>`` 这样的乱码正文。
+    """
+    for tag in ("content", "text", "replacemsg"):
+        value = extract_tag_from_xml(text, tag)
+        if value and "<" not in value:
+            return value
+
+    template = _inner_text(extract_tag_from_xml(text, "template") or "")
+    if template:
+        link_map = _link_text_map(text)
+        rendered = _PLACEHOLDER_RE.sub(lambda m: link_map.get(m.group(1), ""), template)
+        rendered = rendered.strip()
+        if rendered:
+            return rendered
+
+    # 最后兜底：剥标签。比把整段 XML 当正文好得多。
+    return _strip_markup(text)
+
+
 def build_content(local_type: int, raw_content, raw_source) -> str:
     """将 raw_content / raw_source 根据 local_type 构建成可读字符串"""
     if local_type == 1:
@@ -200,11 +284,12 @@ def build_content(local_type: int, raw_content, raw_source) -> str:
         raw = maybe_zstd_decompress(raw_content or raw_source)
         text = raw.decode("utf-8", errors="ignore") if isinstance(raw, bytes) else str(raw or "")
         text = text.strip()
-        if "<sysmsg" in text:
-            for tag in ("content", "text", "replacemsg", "plain"):
-                value = extract_tag_from_xml(text, tag)
-                if value:
-                    return value
+        # 群聊 / 私聊的系统消息前面会带 `<会话 id>:` 标记，先剥掉
+        text = _SYSMSG_PREFIX_RE.sub("", text, count=1)
+        if "<" in text:
+            # 群公告 / 红包 / 企业微信提示里的 <a>、<img>、<_wc_custom_link_> 等
+            # 都是排版标记，要么渲染成提示语，要么至少剥掉标签，别原样上线
+            return _render_sysmsg(text) or "[系统]"
         return text or "[系统]"
 
     label = TYPE_LABELS.get(local_type)
@@ -218,6 +303,15 @@ def build_content(local_type: int, raw_content, raw_source) -> str:
     sub_label = APPMSG_LABELS.get(app_type, "消息")
 
     if xml_text:
+        # 合并转发的「聊天记录」：<recorditem> 里就是完整的子消息列表，直接内联
+        # 渲染，导入后即可读，不必再回解密快照逐条展开（旧实现只剩 [聊天记录] 标题）。
+        if app_type == 19:
+            from .records import render_record_text
+
+            rendered = render_record_text(xml_text)
+            if rendered:
+                return rendered
+
         # 引用消息：<title> 是本次回复内容，<refermsg> 里才是被引用原文与作者
         if app_type == 57:
             reply = extract_tag_from_xml(xml_text, "title")
@@ -229,7 +323,9 @@ def build_content(local_type: int, raw_content, raw_source) -> str:
             if reply:
                 return f"[引用] {reply}"
 
-        title = extract_tag_from_xml(xml_text, "title")
+        # 链接 / 小程序等标题里偶尔夹 HTML（如 <a class="weapp_text_link" …>），
+        # 剥掉标签只保留可读文字，避免正文里出现标签属性
+        title = _strip_markup(extract_tag_from_xml(xml_text, "title") or "")
         if title:
             return f"[{sub_label}] {title}"
         if "<appmsg" in xml_text:
