@@ -484,10 +484,16 @@ def _spawn_detached_worker(force: bool, redecrypt: bool) -> Optional[subprocess.
         return proc
 
     if os.name == "nt":
-        DETACHED_PROCESS = 0x00000008
+        CREATE_NO_WINDOW = 0x08000000
         CREATE_NEW_PROCESS_GROUP = 0x00000200
         CREATE_BREAKAWAY_FROM_JOB = 0x01000000
-        base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        # 用 CREATE_NO_WINDOW 而不是 DETACHED_PROCESS：
+        # uv 装的 `Scripts\python.exe` 只是个启动器，真正的解释器是它再起的子进程。
+        # DETACHED 让启动器没有控制台，于是子进程新建一个**可见**控制台 —— 表现就是
+        # 每次同步/刷新都闪一个标题为 python.exe 路径的黑窗口。CREATE_NO_WINDOW 给
+        # worker 一个隐藏控制台，启动器的子进程直接继承它，全程不弹窗；
+        # 脱离宿主 job 仍由 CREATE_BREAKAWAY_FROM_JOB 负责。
+        base = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
         try:
             return _spawn(base | CREATE_BREAKAWAY_FROM_JOB)
         except OSError as exc:

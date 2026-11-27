@@ -3,6 +3,16 @@
 本文件逐条记录本仓库相对上游 `stkoecn/im-mcp` 初始版本（v0.0.1）的全部改动，
 便于上游维护者对照 review（对应 PR #10）。所有改动均已实测复现后再修改。
 
+## 独立同步进程不再弹控制台窗口
+
+- 现象：每次触发同步/刷新，任务栏会闪一个标题为 `...\Scripts\python.exe` 的黑窗口。
+- 原因：`uv tool install` 生成的 `Scripts\python.exe` 只是启动器，真正的解释器是它再起的
+  子进程。`_spawn_detached_worker` 用 `DETACHED_PROCESS` 让启动器没有控制台，于是子进程
+  新建了一个**可见**控制台。
+- 修复：改用 `CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`，worker 拿到隐藏控制台，
+  启动器的子进程继承它；脱离宿主 job 仍由 `CREATE_BREAKAWAY_FROM_JOB` 负责
+  （`taskkill /T` 依然杀不掉 worker）。
+
 ## 图片 V2 密钥提取、表情明文库与 `emoticon_md5` 贯通（绿泡泡工具 26 → 29 个）
 
 ### 新增 MCP 工具（3 个）
