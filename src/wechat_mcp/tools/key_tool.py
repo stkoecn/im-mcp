@@ -1600,7 +1600,13 @@ def _save_results(db_files: list, salt_to_dbs: dict, key_map: dict, db_dir: str,
 # ============================================================
 
 def auto_detect_db_dir() -> str | None:
-    """自动检测绿泡泡 db_storage 目录。
+    """自动检测绿泡泡 db_storage 目录（返回最可能的当前登录账号）。"""
+    candidates = auto_detect_db_dirs()
+    return candidates[0] if candidates else None
+
+
+def auto_detect_db_dirs() -> list[str]:
+    """自动检测绿泡泡 db_storage 目录，按「当前登录可能性」从高到低返回全部候选。
     Windows: 读取 %APPDATA%\\Tencent\\xwechat\\config\\*.ini 找到数据根目录，再匹配 xwechat_files\\*\\db_storage。
     macOS: 扫描 ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/*/db_storage。
     """
@@ -1643,22 +1649,45 @@ def auto_detect_db_dir() -> str | None:
                     candidates.append(match)
 
     if not candidates:
-        return None
+        return []
     if len(candidates) == 1:
-        return candidates[0]
+        return candidates
 
-    # 多账号（多开）时不能依赖 glob 顺序：取 db_storage 最近被写入的那个，
+    # 多账号（多开）时不能依赖 glob 顺序：按数据库文件的最新写入时间排序，
     # 通常即当前活跃账号，与 config.get_files_root() 保持同一套选择策略。
-    def _mtime(path: str) -> float:
-        try:
-            return os.path.getmtime(path)
-        except OSError:
-            return 0.0
+    # 注意：不能用目录自身的 mtime（只在增删文件时变化，旧账号目录常被误判为最新）。
+    candidates.sort(key=_account_freshness, reverse=True)
+    logger.warning("检测到多个绿泡泡数据目录，按活跃度排序: %s",
+                   ", ".join(candidates))
+    return candidates
 
-    candidates.sort(key=_mtime, reverse=True)
-    logger.warning("检测到多个绿泡泡数据目录，已选用最近活跃的一个: %s（候选: %s）",
-                   candidates[0], ", ".join(candidates))
-    return candidates[0]
+
+def _account_freshness(db_storage: str, max_depth: int = 4) -> float:
+    """db_storage 下数据库文件的最新 mtime（递归，限制深度）；0 表示读不到。"""
+    newest = 0.0
+    try:
+        if not os.path.isdir(db_storage):
+            return 0.0
+        base_depth = len(os.path.abspath(db_storage).split(os.sep))
+    except OSError:
+        return 0.0
+    for dirpath, dirnames, filenames in os.walk(db_storage):
+        try:
+            depth = len(os.path.abspath(dirpath).split(os.sep)) - base_depth
+        except OSError:
+            depth = 0
+        if depth >= max_depth:
+            dirnames[:] = []
+        for name in filenames:
+            if not name.endswith((".db", ".db-wal", ".db-shm", ".db-journal")):
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            if mtime > newest:
+                newest = mtime
+    return newest
 
 
 # ============================================================
@@ -1873,16 +1902,50 @@ def decrypt_all(db_dir: str, out_dir: str, keys_file: str) -> dict:
 # ============================================================
 
 def cmd_extract(args: argparse.Namespace) -> None:
-    db_dir = args.db_dir or auto_detect_db_dir()
-    if not db_dir:
+    """提取密钥入口。
+
+    多账号（多开）场景下，仅凭活跃度排序仍有猜错的概率，因此这里按活跃度
+    依次尝试每个账号目录：只有密钥能通过 page1 校验才会被采用，校验失败就
+    换下一个账号目录，避免「选错账号 → 扫描成功但验证不过 → 直接报错退出」。
+    """
+    if args.db_dir:
+        candidates = [args.db_dir]
+    else:
+        candidates = auto_detect_db_dirs()
+
+    if not candidates:
         _print("[ERROR] 未能自动检测绿泡泡数据库目录，请使用 --db-dir 手动指定")
         sys.exit(1)
+
+    if len(candidates) > 1:
+        _print(f"[*] 检测到 {len(candidates)} 个账号目录，按活跃度依次尝试")
+
+    last_error: Exception | None = None
+    for idx, candidate in enumerate(candidates, 1):
+        try:
+            _cmd_extract_for_dir(args, candidate)
+            if idx > 1:
+                _print(f"[+] 使用账号目录: {candidate}")
+            return
+        except RuntimeError as exc:
+            last_error = exc
+            if args.db_dir:
+                break
+            _print(f"[!] 账号目录不可用: {candidate}")
+            _print(f"    {exc}")
+            if idx < len(candidates):
+                _print("[*] 换下一个账号目录重试 ...")
+
+    _print(f"[ERROR] {last_error}" if last_error else "[ERROR] 密钥提取失败")
+    sys.exit(1)
+
+
+def _cmd_extract_for_dir(args: argparse.Namespace, db_dir: str) -> None:
     _print(f"[*] 数据库目录: {db_dir}")
 
     db_files, salt_to_dbs = collect_db_files(db_dir)
     if not db_files:
-        _print(f"[ERROR] 在 {db_dir} 未找到可解密的 .db 文件")
-        sys.exit(1)
+        raise RuntimeError(f"在 {db_dir} 未找到可解密的 .db 文件")
 
     out_file = args.output
 

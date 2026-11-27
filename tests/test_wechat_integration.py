@@ -138,6 +138,58 @@ class TestRealHostEndToEnd(unittest.TestCase):
                 main()
             self.assertEqual(cm.exception.code, 0)
 
+    def test_auto_detect_db_dirs_prefers_active_account(self):
+        """多账号（多开）时按数据库文件最新写入时间排序，而不是目录自身 mtime。
+
+        回归用例：旧实现用 db_storage 目录的 mtime 排序，长期不用的旧账号目录
+        只要被创建/整理得比较晚，就会被误判为「当前登录账号」，导致密钥扫描
+        结果与所选账号的 salt 对不上（Config.Cipher scan found no verified keys）。
+        """
+        import os
+        import tempfile
+        import time
+
+        from wechat_mcp import config as config_mod
+        from wechat_mcp.tools import key_tool
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stale = os.path.join(tmp, "wxid_stale_0000", "db_storage")
+            active = os.path.join(tmp, "wxid_active_1111", "db_storage")
+            for root in (stale, active):
+                os.makedirs(os.path.join(root, "message"), exist_ok=True)
+                with open(os.path.join(root, "message", "message_0.db"), "wb"):
+                    pass
+
+            now = time.time()
+            # 旧账号：目录 mtime 很新，但数据库文件很久没写过
+            os.utime(stale, (now + 200, now + 200))
+            os.utime(os.path.join(stale, "message", "message_0.db"), (now - 500, now - 500))
+            # 当前账号：目录 mtime 很旧，但数据库文件刚被写入
+            os.utime(active, (now - 300, now - 300))
+            os.utime(os.path.join(active, "message", "message_0.db"), (now, now))
+
+            self.assertGreater(
+                key_tool._account_freshness(active),
+                key_tool._account_freshness(stale),
+            )
+            self.assertGreater(
+                config_mod.account_freshness(Path(active)),
+                config_mod.account_freshness(Path(stale)),
+            )
+            # 目录 mtime 排序会选错，正好验证两种策略的差异
+            self.assertGreater(os.path.getmtime(stale), os.path.getmtime(active))
+
+    def test_auto_detect_db_dir_returns_first_candidate(self):
+        """auto_detect_db_dir 应返回活跃度最高的候选，无候选时返回 None。"""
+        from unittest.mock import patch
+
+        from wechat_mcp.tools import key_tool
+
+        with patch.object(key_tool, "auto_detect_db_dirs", return_value=["a", "b"]):
+            self.assertEqual(key_tool.auto_detect_db_dir(), "a")
+        with patch.object(key_tool, "auto_detect_db_dirs", return_value=[]):
+            self.assertIsNone(key_tool.auto_detect_db_dir())
+
     def test_wechat_init_passphrase_import(self):
         """测试 wechat-init --passphrase 分支，确保 save_passphrase 被正确导入且不抛 NameError."""
         from wechat_mcp.tools.__init__ import main

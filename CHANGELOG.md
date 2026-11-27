@@ -3,6 +3,46 @@
 本文件逐条记录本仓库相对上游 `stkoecn/im-mcp` 初始版本（v0.0.1）的全部改动，
 便于上游维护者对照 review（对应 PR #10）。所有改动均已实测复现后再修改。
 
+## 多账号场景下账号目录选择修正（`wechat-init` 不再选错账号）
+
+### 问题
+
+同一台设备登录过多个账号（多开 / 切换账号）时，`wechat-init` 偶发：
+
+```
+[4.1-runtime] Config.Cipher scan found no verified keys (..., candidates=N)
+[*] falling back to legacy scan
+[ERROR] 无法提取数据库密钥
+```
+
+密钥其实已经从运行中的客户端内存里正确扫出来了，但**选错了账号目录**：
+`auto_detect_db_dir()` 与 `config.get_files_root()` 都按 `db_storage` **目录自身的
+mtime** 排序。目录 mtime 只在增删条目时更新，因此长期不用的旧账号目录只要被
+创建 / 整理得较晚，就会排在当前登录账号之前；于是扫出的密钥被拿去校验另一个
+账号的数据库 salt，必然全部不通过，legacy 回退同样失败。
+
+### 修复
+
+- 新增 `account_freshness()`（`config.py`）与 `_account_freshness()`
+  （`key_tool.py`）：按 `db_storage` 下 `*.db` / `*.db-wal` / `*.db-shm` /
+  `*.db-journal` 的**递归最新 mtime** 判断账号活跃度（限制深度 4，读不到的条目
+  跳过），两处共用同一策略，保证运行期 MCP 与初始化脚本选到同一个账号。
+- 新增 `auto_detect_db_dirs()`：返回按活跃度排序的全部候选；
+  `auto_detect_db_dir()` 保留为兼容包装（返回首个候选 / 无候选时 `None`）。
+- `cmd_extract()` 拆分为入口 + `_cmd_extract_for_dir()`：多候选时**逐个尝试**，
+  只有密钥通过 page1 校验才会被采用，校验失败自动换下一个账号目录，不再
+  「选错账号 → 扫描成功但验证不过 → 直接退出」。显式传入 `--db-dir` 时行为不变。
+- 补 2 个回归测试：目录 mtime 新但数据库文件旧的账号必须排在后面；
+  `auto_detect_db_dir()` 返回值语义。
+
+### 实测
+
+- 修复前：`candidates=32` 但无密钥通过校验，进程以非 0 退出；
+- 修复后：自动选中当前登录账号，全部 salt 命中，`wechat-init` 完整初始化成功
+  （联系人 / 会话 / 消息均正常入库），`start_sync` 增量同步与 `wechat-mcp`
+  工具调用均正常；
+- `python -m unittest discover -s tests`：74 tests OK。
+
 ## 图片 V2 密钥提取、表情明文库与 `emoticon_md5` 贯通（绿泡泡工具 26 → 29 个）
 
 ### 新增 MCP 工具（3 个）
