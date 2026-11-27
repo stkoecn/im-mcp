@@ -24,6 +24,42 @@ DB_PATH = USER_WECHAT_DIR / "app.db"
 USER_WECHAT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+DB_SUFFIXES = (".db", ".db-wal", ".db-shm", ".db-journal")
+
+
+def account_freshness(db_storage: Path, max_depth: int = 4) -> float:
+    """账号活跃度 = db_storage 下数据库文件的最新 mtime（递归，限制深度）。
+
+    用于在多账号目录中判断「当前登录的是哪个账号」。
+    不要用目录自身 mtime：目录 mtime 只在增删条目时更新，
+    旧账号目录如果后期被创建/整理过，会误判为「最近活跃」。
+    """
+    newest = 0.0
+    try:
+        if not db_storage.is_dir():
+            return 0.0
+    except OSError:
+        return 0.0
+    try:
+        base_depth = len(db_storage.parts)
+        for dirpath, dirnames, filenames in os.walk(db_storage):
+            depth = len(Path(dirpath).parts) - base_depth
+            if depth >= max_depth:
+                dirnames[:] = []
+            for name in filenames:
+                if not name.endswith(DB_SUFFIXES):
+                    continue
+                try:
+                    mtime = os.path.getmtime(os.path.join(dirpath, name))
+                except OSError:
+                    continue
+                if mtime > newest:
+                    newest = mtime
+    except OSError:
+        return newest
+    return newest
+
+
 def get_default_storage_dir() -> Path | None:
     """自动获取当前操作系统平台下的微信原始数据存储根目录"""
     if sys.platform == "win32":
@@ -114,13 +150,13 @@ def get_files_root() -> Path | None:
     if len(candidates) == 1:
         return candidates[0]
 
-    # 多账号（多开）时不能依赖 glob 顺序：取 db_storage 最近被写入的那个，
+    # 多账号（多开）时不能依赖 glob 顺序：取数据库文件最近被写入的那个，
     # 通常即当前活跃账号，并记录候选以便排查。
+    #
+    # 注意：不能用 db_storage 目录自身的 mtime——目录 mtime 只在增删文件时变化，
+    # 长期不使用但目录创建较晚的旧账号会「看起来更新」，从而被错误选中。
     def _mtime(root: Path) -> float:
-        try:
-            return (root / "db_storage").stat().st_mtime
-        except OSError:
-            return 0.0
+        return account_freshness(root / "db_storage")
 
     candidates.sort(key=_mtime, reverse=True)
     logger.warning("检测到多个绿泡泡数据目录，已选用最近活跃的一个: %s（候选: %s）",
