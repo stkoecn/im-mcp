@@ -6,6 +6,7 @@ from pathlib import Path
 import logging
 
 from .config import DB_PATH, get_decrypted_dir
+from .parser import PARSER_VERSION
 from .adapters import route_sync
 from .adapters.avatars import sync_avatars_v4
 from .adapters.media import sync_emoticons_v4, sync_favorites_v4, sync_media_v4
@@ -252,7 +253,8 @@ def sync_data(force: bool = False) -> dict:
     _migrate_derived_tables(conn)
     cur = conn.cursor()
 
-    fp = compute_fingerprint(decrypted_dir)
+    # 指纹带上解析版本：解析规则升级后即使解密产物没变，也要重扫一次补齐新字段
+    fp = f"parser:{PARSER_VERSION}:{compute_fingerprint(decrypted_dir)}"
     cur.execute("SELECT value FROM meta WHERE key='fingerprint'")
     row = cur.fetchone()
     if not force and row and row[0] == fp:

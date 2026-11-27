@@ -29,6 +29,7 @@ class TestWeChatParser(unittest.TestCase):
         import sqlite3
 
         from wechat_mcp.adapters.v4 import (
+            PARSER_VERSION,
             _ensure_etl_sources,
             _etl_source_state,
             _save_etl_source,
@@ -40,15 +41,40 @@ class TestWeChatParser(unittest.TestCase):
         self.assertIsNone(_etl_source_state(cur, "message_0.db", "Msg_abc"))
 
         _save_etl_source(cur, "message_0.db", "Msg_abc", 100, 200, 5)
-        self.assertEqual(tuple(_etl_source_state(cur, "message_0.db", "Msg_abc")), (100, 200, 5))
+        self.assertEqual(tuple(_etl_source_state(cur, "message_0.db", "Msg_abc")), (100, 200, 5, PARSER_VERSION))
 
         # 指纹更新但 local_id 变小（例如换库/回滚）时，进度保持较大值
         _save_etl_source(cur, "message_0.db", "Msg_abc", 120, 300, 3)
-        self.assertEqual(tuple(_etl_source_state(cur, "message_0.db", "Msg_abc")), (120, 300, 5))
+        self.assertEqual(tuple(_etl_source_state(cur, "message_0.db", "Msg_abc")), (120, 300, 5, PARSER_VERSION))
 
         # 不同表互不影响
         _save_etl_source(cur, "message_0.db", "Msg_def", 100, 200, 99)
         self.assertEqual(_etl_source_state(cur, "message_0.db", "Msg_def")[2], 99)
+
+    def test_parser_version_invalidates_progress(self):
+        # 解析规则升级后，旧进度（parser_version 为空或不同）必须作废 → 该表全量重扫一次
+        import sqlite3
+
+        from wechat_mcp.adapters.v4 import (
+            PARSER_VERSION,
+            _ensure_etl_sources,
+            _etl_source_state,
+        )
+
+        conn = sqlite3.connect(":memory:")
+        cur = conn.cursor()
+        _ensure_etl_sources(cur)
+        # 模拟旧版本建的进度表（没有 parser_version 列）
+        cur.execute("DROP TABLE etl_sources")
+        cur.execute(
+            "CREATE TABLE etl_sources (source_file TEXT, table_name TEXT, size INTEGER, "
+            "mtime_ns INTEGER, max_local_id INTEGER, PRIMARY KEY (source_file, table_name))"
+        )
+        cur.execute("INSERT INTO etl_sources VALUES('m.db','Msg_a',9,9,42)")
+        _ensure_etl_sources(cur)  # 迁移补列
+        state = _etl_source_state(cur, "m.db", "Msg_a")
+        self.assertEqual(state[2], 42)
+        self.assertNotEqual(state[3], PARSER_VERSION)
 
     def test_parse_file_media(self):
         # [文件] 消息里的 <md5> 是关联 media_files 的唯一可靠键

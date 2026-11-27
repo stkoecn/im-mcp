@@ -4,6 +4,11 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+# 消息解析版本：content / emoticon_md5 / media_md5 的提取规则一变就 +1。
+# 它同时参与两处增量判断（全局指纹 + etl_sources 指纹）——版本对不上时旧进度作废，
+# 下次刷新自动全量重扫一次（补齐新字段），之后又回到「只读新增行」的增量模式。
+PARSER_VERSION = "4"
+
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 try:

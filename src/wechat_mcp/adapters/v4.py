@@ -19,7 +19,12 @@ import logging
 from pathlib import Path
 from typing import Dict
 
-from ..parser import build_content, extract_emoticon_md5, parse_file_media
+from ..parser import (
+    PARSER_VERSION,
+    build_content,
+    extract_emoticon_md5,
+    parse_file_media,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,15 +56,21 @@ def _ensure_etl_sources(cur: sqlite3.Cursor) -> None:
             size         INTEGER,
             mtime_ns     INTEGER,
             max_local_id INTEGER,
+            parser_version TEXT,
             PRIMARY KEY (source_file, table_name)
         )
         """
     )
+    # 旧版本建的进度表没有 parser_version 列，补上（值留空 → 指纹必然不等于当前版本）
+    try:
+        cur.execute("ALTER TABLE etl_sources ADD COLUMN parser_version TEXT")
+    except sqlite3.OperationalError:
+        pass
 
 
 def _etl_source_state(cur: sqlite3.Cursor, source_file: str, table_name: str):
     row = cur.execute(
-        "SELECT size, mtime_ns, max_local_id FROM etl_sources "
+        "SELECT size, mtime_ns, max_local_id, parser_version FROM etl_sources "
         "WHERE source_file = ? AND table_name = ?",
         (source_file, table_name),
     ).fetchone()
@@ -70,14 +81,15 @@ def _save_etl_source(cur: sqlite3.Cursor, source_file: str, table_name: str,
                      size: int, mtime_ns: int, max_local_id: int) -> None:
     cur.execute(
         """
-        INSERT INTO etl_sources (source_file, table_name, size, mtime_ns, max_local_id)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO etl_sources (source_file, table_name, size, mtime_ns, max_local_id, parser_version)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_file, table_name) DO UPDATE SET
             size = excluded.size,
             mtime_ns = excluded.mtime_ns,
-            max_local_id = MAX(COALESCE(etl_sources.max_local_id, 0), excluded.max_local_id)
+            max_local_id = MAX(COALESCE(etl_sources.max_local_id, 0), excluded.max_local_id),
+            parser_version = excluded.parser_version
         """,
-        (source_file, table_name, size, mtime_ns, max_local_id),
+        (source_file, table_name, size, mtime_ns, max_local_id, PARSER_VERSION),
     )
 
 
@@ -231,9 +243,11 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor, force: bool = False) -> No
                     # 剪枝：该表所在库没有变化 → 整表跳过；库变了 → 只取新消息
                     since = None
                     state = _etl_source_state(cur, db_file.name, tbl)
-                    if state and not force and state[0] == file_size and state[1] == file_mtime:
+                    fresh = bool(state) and not force
+                    current = fresh and state[3] == PARSER_VERSION
+                    if fresh and current and state[0] == file_size and state[1] == file_mtime:
                         continue
-                    if state and not force and state[2]:
+                    if current and state[2]:
                         since = int(state[2])
                     max_seen = since or 0
 
@@ -267,9 +281,11 @@ def sync_v4(decrypted_dir: Path, cur: sqlite3.Cursor, force: bool = False) -> No
                         )
 
                         # [文件] 消息：把 XML 里的 md5 存下来，查询时才能关联到
-                        # media_files 的磁盘路径（否则只有文件名，没法打开原件）
+                        # media_files 的磁盘路径（否则只有文件名，没法打开原件）。
+                        # content 已经是渲染后的 "[文件] xxx"，只对它做一次解压解析，
+                        # 避免对十万级消息逐条解压。
                         media_md5 = None
-                        if r["local_type"] and "<appmsg" in content and "<md5>" in content:
+                        if content.startswith("[文件]"):
                             meta = parse_file_media(r["message_content"] or r["source"])
                             media_md5 = (meta or {}).get("md5") or None
 
